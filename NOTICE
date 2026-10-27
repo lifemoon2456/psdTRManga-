@@ -1,0 +1,53 @@
+Manga PSD Studio
+Copyright (C) 2026 Manga PSD Studio contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+details. The full license text is in LICENSE.
+
+This project is a modified/adapted work. Portions of the detection,
+inpainting, canvas, and pipeline code were adapted from Libre Manga Translator
+in 2026. The upstream project is:
+
+  Libre Manga Translator
+  Copyright (C) 2026 Libre Manga Translator
+  Licensed AGPL-3.0-or-later
+  https://github.com/mrdhnto/libre-manga-translator
+
+The upstream license, including its model, font, technique, and dependency
+attributions, is preserved verbatim in
+licenses/LibreMangaTranslator-LICENSE.txt.
+
+Libre Manga Translator is itself a derivative of ComicTL:
+
+  ComicTL
+  Copyright (c) 2025-2026 Ketut Shridhara
+  MIT License
+  https://github.com/kiuyha/ComicTL
+
+The ComicTL MIT notice is preserved in licenses/ComicTL-MIT.txt and in the
+upstream license file. As permitted by the MIT License, the combined work is
+conveyed under AGPL-3.0-or-later.
+
+Additional credits preserved from the upstream license include the Local Manga
+Translator proof-of-concept by Riski Mardhianto
+(https://github.com/mrdhnto/local-manga-translator), and Manga Cleaner by KoMiQ
+(GPL-3.0, https://github.com/k-omiq/manga-cleaner) for published inpainting and
+gate techniques studied without copying source code.
+
+Other third-party components, fonts, dictionaries, and on-demand model
+weights are listed in THIRD_PARTY_NOTICES.md. No model weights are bundled in
+this repository; they are downloaded at runtime under their own licenses.
+
+The complete corresponding source code for this program is this repository.
+If you deploy a modified version as a network service, AGPL section 13
+requires you to offer the corresponding source code to its users.
+
+Manga PSD Studio is an independent standalone application. It does not modify
+or bundle the upstream Libre Manga Translator browser extension.

@@ -1,0 +1,36 @@
+{
+  "name": "manga-psd-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Standalone web app for translating English/Japanese manga pages into Arabic and exporting editable PSD files.",
+  "license": "AGPL-3.0-or-later",
+  "author": "Manga PSD Studio contributors",
+  "keywords": [
+    "manga",
+    "translation",
+    "arabic",
+    "psd",
+    "inpainting",
+    "onnx"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "postbuild": "node scripts/copy-legal.mjs",
+    "preview": "vite preview",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ag-psd": "^33.0.0",
+    "jszip": "^3.10.1",
+    "onnxruntime-web": "1.31.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vite": "^7.0.0"
+  }
+}
