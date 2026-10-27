@@ -6,6 +6,14 @@
   "description": "Standalone web app for translating English/Japanese manga pages into Arabic and exporting editable PSD files.",
   "license": "AGPL-3.0-or-later",
   "author": "Manga PSD Studio contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lifemoon2456/psdTRManga-.git"
+  },
+  "homepage": "https://github.com/lifemoon2456/psdTRManga-#readme",
+  "bugs": {
+    "url": "https://github.com/lifemoon2456/psdTRManga-/issues"
+  },
   "keywords": [
     "manga",
     "translation",

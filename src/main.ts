@@ -171,7 +171,8 @@ function renderShell(): void {
       <div class="footer-note">
         © 2026 Manga PSD Studio contributors — AGPL-3.0-or-later.
         يتضمن كودًا معدّلًا من Libre Manga Translator (AGPL) وComicTL (MIT).
-        <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">نص الترخيص</a>.
+        <a href="https://github.com/lifemoon2456/psdTRManga-" target="_blank" rel="noreferrer">الكود المصدري</a>
+        · <a href="https://www.gnu.org/licenses/agpl-3.0.html" target="_blank" rel="noreferrer">نص الترخيص</a>.
         راجع <code>LICENSE</code> و<code>NOTICE</code> و<code>THIRD_PARTY_NOTICES.md</code> في المستودع.
       </div>
       <div class="toast-stack" id="toasts"></div>

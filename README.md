@@ -222,17 +222,18 @@ Cross-Origin-Embedder-Policy: require-corp
 المشروع مهيأ للنشر كمستودع مصدر مفتوح. الملفات القانونية المطلوبة موجودة:
 `LICENSE`، `NOTICE`، `THIRD_PARTY_NOTICES.md`، و`licenses/`، مع نص AGPL كامل.
 
+المستودع المنشور: <https://github.com/lifemoon2456/psdTRManga->
+
 ### ربط المستودع ودفعه
 
-تمت تهيئة مستودع Git محليًا على فرع `main` مع commit أول. أنشئ مستودعًا فارغًا على
-GitHub (بدون README أو LICENSE إضافي)، ثم:
+تمت تهيئة مستودع Git محليًا على فرع `main` مع commit أول، وربطه بالمستودع
+`origin`. لأي نسخة جديدة:
 
 ```bash
-git remote add origin https://github.com/<USER>/<REPO>.git
+git remote add origin https://github.com/lifemoon2456/psdTRManga-.git   # إن لم يكن مضافًا
 git push -u origin main
 ```
 
-- استبدل `<USER>` و`<REPO>` بحسابك واسم المستودع.
 - التزام Git الأول يستخدم هوية Git المحلية. إذا كنت لا تريد ظهور بريدك في
   تاريخ المستودع، عيّن بريد GitHub الخاص قبل الدفع:
   `git config user.email "USER@users.noreply.github.com"` ثم
@@ -380,8 +381,8 @@ Libre Manga Translator المرخص بـ AGPL-3.0-or-later. راجع [LICENSE](L
 - صفحة العينة — CC0 1.0 (انظر `samples/README.md`).
 
 التفاصيل الكاملة في [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). الكود
-المصدري الكامل هو هذا المستودع. إذا نشرت نسخة معدلة كخدمة شبكة، يجب أن توفر
-الكود المصدري لمستخدميها وفق AGPL §13. نسخة البناء تضع نسخًا من `LICENSE`
-و`NOTICE` وملفات التراخيص في `dist/legal/`، وتراخيص حزم npm في
-`dist/legal/npm/`. إذا عدّلت المشروع، أضف إشعارًا واضحًا بالتعديلات واحتفظ
-بإشعارات حقوق النشر والتراخيص.
+المصدري الكامل متاح في [مستودع GitHub](https://github.com/lifemoon2456/psdTRManga-).
+إذا نشرت نسخة معدلة كخدمة شبكة، يجب أن توفر الكود المصدري لمستخدميها وفق
+AGPL §13. نسخة البناء تضع نسخًا من `LICENSE` و`NOTICE` وملفات التراخيص في
+`dist/legal/`، وتراخيص حزم npm في `dist/legal/npm/`. إذا عدّلت المشروع، أضف
+إشعارًا واضحًا بالتعديلات واحتفظ بإشعارات حقوق النشر والتراخيص.

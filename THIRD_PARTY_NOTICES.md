@@ -163,10 +163,11 @@ license.
 
 ## Source code and network use
 
-The complete corresponding source for Manga PSD Studio is this repository.
-The production build copies `LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, and
-`licenses/` into `dist/legal/` so release artifacts carry the notices. It also
-collects runtime npm license files under `dist/legal/npm/`.
+The complete corresponding source for Manga PSD Studio is available at
+<https://github.com/lifemoon2456/psdTRManga->. The production build copies
+`LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, and `licenses/` into
+`dist/legal/` so release artifacts carry the notices. It also collects runtime
+npm license files under `dist/legal/npm/`.
 
 If you deploy a modified version as a network service, AGPL section 13
 requires you to offer the corresponding source code to users of that service.
