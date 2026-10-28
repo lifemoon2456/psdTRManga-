@@ -16,6 +16,8 @@ interface Bbox {
   x2: number;
   y2: number;
   confidence: number;
+  /** Created or adjusted by the user in the manual box editor. */
+  manual?: boolean;
   gateSkip?: "not-japanese" | "low-confidence";
   inpaintDeclined?: boolean;
   style?: TextStyle;

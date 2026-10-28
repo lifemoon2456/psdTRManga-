@@ -10,10 +10,31 @@ import {
   loadCustomFonts,
   removeCustomFont,
 } from "./lib/custom-fonts";
-import { analyzePage, renderPage, type PipelineStage } from "./lib/pipeline";
+import {
+  analyzePage,
+  renderPage,
+  type PageAnalysis,
+  type PipelineStage,
+} from "./lib/pipeline";
+import {
+  PROJECT_FILE_EXTENSION,
+  PROJECT_VERSION,
+  applyProjectSettings,
+  exportProjectFile,
+  importProjectFile,
+  loadProjectSnapshot,
+  projectSettingsFromApp,
+  projectStatus,
+  saveProjectSnapshot,
+  SUPPORTED_IMAGE_TYPES,
+  type ProjectPage,
+  type ProjectSnapshot,
+} from "./lib/project";
 import { downloadBytes } from "./lib/psd";
+import { translatePage } from "./lib/translation";
 import {
   baseName,
+  clamp,
   downloadBlob,
   downloadDataUrl,
   escapeHtml,
@@ -42,9 +63,41 @@ const state = {
   status: "جاهز. أضف صفحات مانجا للبدء.",
   progress: 0,
   previewTab: "original" as PreviewTab,
+  boxEditMode: false,
+  selectedBoxIndex: null as number | null,
+  projectSaving: false,
+  projectSavedAt: null as number | null,
+  projectError: "",
+  restoringProject: false,
 };
 
 let nextId = 1;
+let projectSaveTimer: number | null = null;
+let projectSavePromise: Promise<boolean> | null = null;
+let projectSaveQueued = false;
+
+const BOX_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const;
+type BoxHandle = (typeof BOX_HANDLES)[number];
+const BOX_MIN_SIZE = 10;
+
+interface BoxDragState {
+  mode: "draw" | "move" | "resize";
+  pointerId: number;
+  jobId: string;
+  overlay: HTMLElement;
+  boxIndex: number | null;
+  handle: BoxHandle | null;
+  startX: number;
+  startY: number;
+  startBox: Bbox | null;
+  currentBox: Bbox | null;
+  draft: HTMLElement | null;
+  moved: boolean;
+  pageWidth: number;
+  pageHeight: number;
+}
+
+let boxDrag: BoxDragState | null = null;
 
 const STAGE_PROGRESS: Record<PipelineStage, number> = {
   detect: 14,
@@ -94,12 +147,30 @@ function renderShell(): void {
         </div>
       </header>
 
+      <div class="project-bar">
+        <div class="project-bar-info">
+          <strong>المشروع</strong>
+          <span id="project-state" class="project-state" role="status">الحفظ التلقائي مفعّل</span>
+        </div>
+        <div class="project-bar-actions">
+          <button class="small" id="save-project">حفظ الآن</button>
+          <button class="small" id="export-project">تصدير المشروع</button>
+          <button class="small" id="import-project">استيراد مشروع</button>
+          <input
+            id="project-input"
+            type="file"
+            accept=".mpsproj,.zip,application/zip,application/x-zip-compressed"
+            hidden
+          />
+        </div>
+      </div>
+
       <div class="workspace">
         <main class="main">
           <section class="panel">
             <div class="panel-head">
               <h2>إضافة صفحات</h2>
-              <span class="badge">صور PNG / JPG / WebP</span>
+              <span class="badge">صور PNG / JPG / WebP / GIF / AVIF</span>
             </div>
             <div class="panel-body">
               <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="اختيار صفحات مانجا">
@@ -136,10 +207,13 @@ function renderShell(): void {
           <section class="panel">
             <div class="panel-head">
               <h2>المعاينة</h2>
-              <div class="preview-tabs" id="preview-tabs">
-                <button class="small active" data-tab="original">الأصلية</button>
-                <button class="small" data-tab="cleaned" disabled>المنظفة</button>
-                <button class="small" data-tab="final" disabled>النهائية</button>
+              <div class="preview-head-actions">
+                <div class="preview-tabs" id="preview-tabs">
+                  <button class="small active" data-tab="original">الأصلية</button>
+                  <button class="small" data-tab="cleaned" disabled>المنظفة</button>
+                  <button class="small" data-tab="final" disabled>النهائية</button>
+                </div>
+                <button class="small" id="toggle-box-editor" disabled>تحرير الصناديق</button>
               </div>
             </div>
             <div class="panel-body">
@@ -157,6 +231,7 @@ function renderShell(): void {
               <h2>النصوص والترجمة <span id="translation-count" class="badge">0</span></h2>
               <div style="display:flex; gap:6px; flex-wrap:wrap">
                 <button class="small" id="reanalyze-selected">إعادة تحليل</button>
+                <button class="small" id="retranslate-selected">ترجمة المناطق الحالية</button>
                 <button class="small" id="render-selected">تركيب وتحديث PSD</button>
                 <button class="small primary" id="download-selected">تنزيل PSD</button>
               </div>
@@ -450,9 +525,15 @@ function renderHelp(): void {
       <li>اختر لغة المصدر ومحرك الترجمة، ثم «تحليل الكل».</li>
       <li>اختر خط النص من الإعدادات، أو أضف خطك الخاص (TTF / OTF / WOFF / WOFF2).</li>
       <li>راجع النص الأصلي والترجمة في الجدول وعدّل ما تريد.</li>
+      <li>استخدم «تحرير الصناديق» لإضافة صندوق فات من الكشف أو تصحيح موضع/حجم صندوق.</li>
       <li>اضغط «تركيب وتحديث PSD» ثم نزّل الملف.</li>
     </ol>
     <div class="divider"></div>
+    <div class="notice info" style="margin-bottom:10px">
+      <strong>الحفظ التلقائي:</strong> تُحفظ الصفحات والصناديق والترجمات في IndexedDB داخل هذا المتصفح.
+      زر «حفظ الآن» يكتب فورًا، و«تصدير المشروع» ينشئ ملف <code>.mpsproj</code> يمكن استيراده لاحقًا.
+      لا يضمّ ملف المشروع مفاتيح API ولا ملفات الخطوط المخصصة، ولا يحفظ ملفات PSD الناتجة.
+    </div>
     <div class="notice info" style="margin-bottom:10px">
       ملف PSD يحتوي خلفية منظفة + طبقة نص قابلة للتعديل لكل فقاعة. عند تفعيل «طبقة المعاينة النقطية»
       تظهر نسخة عربية مطابقة للمتصفح فوق طبقات التعديل، وتبقى طبقات النص ظاهرة أسفلها ومزوّدة بصورة نقطية.
@@ -533,6 +614,8 @@ function renderPreview(): void {
 
   const job = selectedJob();
   if (!job) {
+    state.boxEditMode = false;
+    state.selectedBoxIndex = null;
     stage.innerHTML = `<div class="empty">اختر صفحة لعرض المعاينة.</div>`;
     side.innerHTML = "";
     tabs.forEach((tab) => {
@@ -541,15 +624,28 @@ function renderPreview(): void {
     return;
   }
 
+  if (!job.analysis) {
+    state.boxEditMode = false;
+    state.selectedBoxIndex = null;
+  }
+  if (
+    state.selectedBoxIndex !== null &&
+    (!job.analysis || state.selectedBoxIndex >= job.analysis.boxes.length)
+  ) {
+    state.selectedBoxIndex = null;
+  }
+
   const hasRender = Boolean(job.render);
   let tab = state.previewTab;
   if ((tab === "cleaned" || tab === "final") && !hasRender) tab = "original";
+  if (state.boxEditMode) tab = "original";
   state.previewTab = tab;
 
   tabs.forEach((button) => {
     const value = button.dataset.tab as PreviewTab;
     button.classList.toggle("active", value === tab);
-    button.disabled = value !== "original" && !hasRender;
+    button.disabled =
+      (value !== "original" && !hasRender) || (state.boxEditMode && value !== "original");
   });
 
   const src =
@@ -558,9 +654,19 @@ function renderPreview(): void {
       : tab === "cleaned"
         ? job.render?.cleanedUrl
         : job.url;
+  const editingBoxes = state.boxEditMode && tab === "original" && Boolean(job.analysis);
 
   if (!src) {
     stage.innerHTML = `<div class="empty">لا توجد صورة معاينة لهذه الحالة بعد.</div>`;
+  } else if (editingBoxes) {
+    stage.innerHTML = `
+      <div class="box-editor" id="box-editor">
+        <img src="${escapeHtml(src)}" alt="معاينة ${escapeHtml(job.name)}" draggable="false" />
+        <div class="box-overlay" id="box-overlay" aria-label="محرر صناديق النص">
+          ${boxOverlayMarkup(job)}
+        </div>
+      </div>
+    `;
   } else {
     stage.innerHTML = `<img src="${escapeHtml(src)}" alt="معاينة ${escapeHtml(job.name)}" />`;
   }
@@ -570,6 +676,15 @@ function renderPreview(): void {
     : 0;
   const boxCount = job.analysis?.boxes.length ?? 0;
   const psdSize = job.render ? formatBytes(job.render.psd.byteLength) : "—";
+  const selectedBox =
+    job.analysis && state.selectedBoxIndex !== null
+      ? job.analysis.boxes[state.selectedBoxIndex] ?? null
+      : null;
+  const selectionText = selectedBox
+    ? `#${(state.selectedBoxIndex ?? 0) + 1} · ${Math.round(
+        selectedBox.x2 - selectedBox.x1,
+      )} × ${Math.round(selectedBox.y2 - selectedBox.y1)} px`
+    : "لم تحدد صندوقًا";
 
   side.innerHTML = `
     <div class="stat"><b>الملف</b><span>${escapeHtml(job.name)}</span></div>
@@ -579,14 +694,125 @@ function renderPreview(): void {
     <div class="stat"><b>حجم PSD</b><span>${psdSize}</span></div>
     ${
       job.dirty
-        ? `<div class="notice">تم تعديل الترجمة بعد آخر تركيب. اضغط «تركيب وتحديث PSD» لتطبيق التعديلات.</div>`
+        ? `<div class="notice">${
+            job.render
+              ? "تم تعديل الترجمة بعد آخر تركيب. اضغط «تركيب وتحديث PSD» لتطبيق التعديلات."
+              : "لم يُنشأ PSD بعد أو تم استئناف المشروع. اضغط «تركيب وتحديث PSD» لإنشاء الملف."
+          }</div>`
         : ""
     }
     ${job.error ? `<div class="notice err">${escapeHtml(job.error)}</div>` : ""}
+    <button
+      class="${state.boxEditMode ? "primary" : ""}"
+      data-preview-action="edit-boxes"
+      ${state.busy || !job.analysis ? "disabled" : ""}
+    >${state.boxEditMode ? "إنهاء تحرير الصناديق" : "تحرير الصناديق"}</button>
+    ${
+      state.boxEditMode
+        ? `
+          <div class="box-editor-panel">
+            <div class="notice info">
+              اسحب على الصورة لرسم صندوق جديد. اسحب الصندوق لتحريكه، واسحب المقابض لتغيير الحجم.
+              اضغط Delete لحذف المحدد، والأسهم لتحريكه بدقة.
+            </div>
+            <div class="box-selection-label" id="box-selection-label">${escapeHtml(selectionText)}</div>
+            <div class="box-editor-actions">
+              <button
+                class="small danger"
+                data-box-action="delete"
+                ${state.busy || state.selectedBoxIndex === null ? "disabled" : ""}
+              >حذف المحدد</button>
+              <button
+                class="small"
+                data-box-action="translate"
+                ${state.busy || state.settings.engine === "manual" || boxCount === 0 ? "disabled" : ""}
+              >ترجمة المناطق</button>
+            </div>
+            ${
+              state.settings.engine === "manual"
+                ? `<div class="hint">الوضع اليدوي: اكتب الترجمة العربية في جدول النصوص.</div>`
+                : ""
+            }
+          </div>
+        `
+        : ""
+    }
     <button class="primary" data-preview-action="psd" ${state.busy ? "disabled" : ""}>تنزيل PSD</button>
     <button data-preview-action="png" ${state.busy ? "disabled" : ""}>تنزيل PNG</button>
     <button data-preview-action="render" ${state.busy ? "disabled" : ""}>إعادة التركيب</button>
   `;
+  updateBoxEditorSelectionUi();
+}
+
+function boxPositionStyle(box: Bbox, width: number, height: number): string {
+  const safeWidth = Math.max(1, width);
+  const safeHeight = Math.max(1, height);
+  const left = clamp(box.x1, 0, safeWidth);
+  const top = clamp(box.y1, 0, safeHeight);
+  const right = clamp(box.x2, left + 1, safeWidth);
+  const bottom = clamp(box.y2, top + 1, safeHeight);
+  return [
+    `left:${(left / safeWidth) * 100}%`,
+    `top:${(top / safeHeight) * 100}%`,
+    `width:${((right - left) / safeWidth) * 100}%`,
+    `height:${((bottom - top) / safeHeight) * 100}%`,
+  ].join(";");
+}
+
+function boxOverlayMarkup(job: PageJob): string {
+  const analysis = job.analysis;
+  if (!analysis) return "";
+  const width = job.width || 1;
+  const height = job.height || 1;
+  return analysis.boxes
+    .map((box, index) => {
+      const selected = state.selectedBoxIndex === index;
+      const translation = analysis.translations[index]?.trim() || `منطقة ${index + 1}`;
+      const label = `#${index + 1}${box.manual ? " · يدوي" : ""}`;
+      const handles = BOX_HANDLES.map(
+        (handle) =>
+          `<span class="box-handle ${handle}" data-handle="${handle}" aria-hidden="true"></span>`,
+      ).join("");
+      return `
+        <div
+          class="box-item${selected ? " selected" : ""}${box.manual ? " manual" : ""}"
+          data-box-index="${index}"
+          style="${boxPositionStyle(box, width, height)}"
+          title="${escapeHtml(translation)}"
+        >
+          <span class="box-label">${escapeHtml(label)}</span>
+          ${handles}
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function updateBoxEditorSelectionUi(): void {
+  const selected = state.selectedBoxIndex;
+  document.querySelectorAll<HTMLElement>("[data-box-index]").forEach((element) => {
+    const index = Number(element.dataset.boxIndex);
+    element.classList.toggle("selected", index === selected);
+  });
+  const label = document.getElementById("box-selection-label");
+  const job = selectedJob();
+  if (label && job?.analysis && selected !== null) {
+    const box = job.analysis.boxes[selected];
+    if (box) {
+      label.textContent = `#${selected + 1} · ${Math.round(box.x2 - box.x1)} × ${Math.round(
+        box.y2 - box.y1,
+      )} px`;
+    }
+  } else if (label) {
+    label.textContent = "لم تحدد صندوقًا";
+  }
+  const deleteButton = document.querySelector<HTMLButtonElement>('[data-box-action="delete"]');
+  if (deleteButton) deleteButton.disabled = state.busy || selected === null;
+}
+
+function setSelectedBox(index: number | null): void {
+  state.selectedBoxIndex = index;
+  updateBoxEditorSelectionUi();
 }
 
 function renderTranslations(): void {
@@ -620,14 +846,18 @@ function renderTranslations(): void {
 
   const rows = boxes
     .map((box, index) => {
-      const source = sourceTexts[index]?.trim() || "—";
+      const source = sourceTexts[index] ?? "";
       const translation = translations[index] ?? "";
+      const selected = state.selectedBoxIndex === index;
       return `
-        <tr>
+        <tr data-box-index="${index}" class="${selected ? "selected" : ""}">
           <td>${index + 1}</td>
           <td>
-            <div class="source-text">${escapeHtml(source)}</div>
-            <div class="hint" style="margin-top:4px">ثقة ${box.confidence.toFixed(2)}</div>
+            <textarea class="source-input" data-source-index="${index}" spellcheck="false"
+              placeholder="النص الأصلي…">${escapeHtml(source)}</textarea>
+            <div class="hint" style="margin-top:4px">
+              ثقة ${box.confidence.toFixed(2)}${box.manual ? " · صندوق يدوي" : ""}
+            </div>
           </td>
           <td>
             <textarea data-index="${index}" spellcheck="false"
@@ -644,12 +874,17 @@ function renderTranslations(): void {
         ? `<div class="notice info" style="margin-bottom:10px">الوضع اليدوي: اكتب الترجمة العربية لكل منطقة، ثم اضغط «تركيب وتحديث PSD».</div>`
         : ""
     }
+    ${
+      state.boxEditMode
+        ? `<div class="notice info" style="margin-bottom:10px">وضع تحرير الصناديق مفعّل: اختر صندوقًا من الصورة أو من الصفوف، ثم عدّل موضعه أو حجمه. الترجمة الأصلية قابلة للتعديل أيضًا.</div>`
+        : ""
+    }
     <div class="table-wrap">
       <table class="translations">
         <thead>
           <tr>
             <th>#</th>
-            <th>النص الأصلي (مراجعة)</th>
+            <th>النص الأصلي (قابل للتعديل)</th>
             <th>الترجمة العربية (قابلة للتعديل)</th>
           </tr>
         </thead>
@@ -671,6 +906,34 @@ function renderStatus(): void {
   updateControls();
 }
 
+function formatSavedTime(timestamp: number): string {
+  try {
+    return new Intl.DateTimeFormat("ar", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }).format(timestamp);
+  } catch {
+    return new Date(timestamp).toLocaleTimeString();
+  }
+}
+
+function renderProjectState(): void {
+  const element = document.getElementById("project-state");
+  if (!element) return;
+  element.classList.toggle("err", Boolean(state.projectError));
+  element.title = state.projectError;
+  if (state.projectSaving) {
+    element.textContent = "جاري حفظ المشروع…";
+  } else if (state.projectError) {
+    element.textContent = "تعذّر الوصول إلى المشروع";
+  } else if (state.projectSavedAt) {
+    element.textContent = `محفوظ محليًا ${formatSavedTime(state.projectSavedAt)}`;
+  } else {
+    element.textContent = "الحفظ التلقائي مفعّل";
+  }
+}
+
 function updateControls(): void {
   const hasPages = state.pages.length > 0;
   const job = selectedJob();
@@ -685,8 +948,27 @@ function updateControls(): void {
   setDisabled("clear-all", state.busy || !hasPages);
   setDisabled("add-more", state.busy);
   setDisabled("reanalyze-selected", state.busy || !job);
+  setDisabled(
+    "retranslate-selected",
+    state.busy ||
+      !job?.analysis ||
+      job.analysis.boxes.length === 0 ||
+      state.settings.engine === "manual",
+  );
   setDisabled("render-selected", state.busy || !job || !job.analysis);
   setDisabled("download-selected", state.busy || !job);
+  setDisabled("save-project", state.busy);
+  setDisabled("export-project", state.busy || !hasPages);
+  setDisabled("import-project", state.busy);
+  setDisabled("toggle-box-editor", state.busy || !job?.analysis);
+
+  const toggle = document.getElementById("toggle-box-editor");
+  if (toggle) {
+    toggle.textContent = state.boxEditMode ? "إنهاء تحرير الصناديق" : "تحرير الصناديق";
+    toggle.classList.toggle("primary", state.boxEditMode);
+    toggle.setAttribute("aria-pressed", String(state.boxEditMode));
+  }
+  updateBoxEditorSelectionUi();
 }
 
 function setProgress(stage: PipelineStage, message?: string): void {
@@ -700,6 +982,7 @@ function refreshAll(): void {
   renderPreview();
   renderTranslations();
   renderStatus();
+  renderProjectState();
 }
 
 function refreshProgress(): void {
@@ -717,6 +1000,8 @@ async function doAnalyze(job: PageJob): Promise<void> {
   job.stage = "تهيئة الكشف…";
   job.render = null;
   job.dirty = false;
+  state.boxEditMode = false;
+  state.selectedBoxIndex = null;
   state.progress = 0;
   state.status = `تحليل ${job.name}…`;
   refreshAll();
@@ -750,6 +1035,7 @@ async function doAnalyze(job: PageJob): Promise<void> {
     throw err;
   } finally {
     refreshAll();
+    scheduleProjectSave();
   }
 }
 
@@ -769,6 +1055,8 @@ async function doRender(job: PageJob): Promise<void> {
   job.status = "rendering";
   job.error = "";
   job.stage = "تنظيف الصفحة…";
+  state.boxEditMode = false;
+  state.selectedBoxIndex = null;
   state.progress = 0;
   state.status = `تركيب ${job.name}…`;
   refreshAll();
@@ -800,6 +1088,7 @@ async function doRender(job: PageJob): Promise<void> {
     throw err;
   } finally {
     refreshAll();
+    scheduleProjectSave();
   }
 }
 
@@ -812,6 +1101,417 @@ async function ensureRender(job: PageJob): Promise<void> {
   if (!job.render || job.dirty) await doRender(job);
 }
 
+async function retranslateSelected(): Promise<void> {
+  const job = selectedJob();
+  if (!job?.analysis) {
+    toast("حلل الصفحة أولًا قبل ترجمة المناطق.", "err");
+    return;
+  }
+  if (state.settings.engine === "manual") {
+    toast("الوضع اليدوي لا يستدعي مزود ترجمة. اكتب النص في الجدول.", "err");
+    return;
+  }
+  if (job.analysis.boxes.length === 0) {
+    toast("لا توجد مناطق نص لترجمتها.", "err");
+    return;
+  }
+  const hasTranslations = job.analysis.translations.some((text) => text.trim());
+  if (
+    hasTranslations &&
+    !window.confirm(
+      "ستُستبدل الترجمات الحالية لكل المناطق، بما فيها التعديلات اليدوية. هل تريد المتابعة؟",
+    )
+  ) {
+    return;
+  }
+
+  await runTask(`ترجمة مناطق ${job.name}…`, async () => {
+    job.stage = "ترجمة المناطق الحالية…";
+    refreshProgress();
+    try {
+      const result = await translatePage(
+        job.url,
+        job.analysis!.boxes,
+        toPipelineSettings(state.settings).translation,
+      );
+      job.analysis!.translations = job.analysis!.boxes.map(
+        (_, index) => result.translations[index] ?? "",
+      );
+      job.analysis!.sourceTexts = job.analysis!.boxes.map(
+        (_, index) => result.sourceTexts?.[index] ?? "",
+      );
+      job.dirty = true;
+      if (job.status === "done") job.status = "ready";
+      job.stage = `${job.analysis!.boxes.length} منطقة مترجمة`;
+      state.progress = 100;
+      state.status = `تمت ترجمة مناطق ${job.name}.`;
+      scheduleProjectSave();
+    } catch (error) {
+      job.stage = "فشلت ترجمة المناطق";
+      throw error;
+    } finally {
+      refreshAll();
+    }
+  });
+}
+
+function toggleBoxEditor(force?: boolean): void {
+  if (state.busy) return;
+  const job = selectedJob();
+  if (!job?.analysis) {
+    toast("حلل الصفحة أولًا لتحرير الصناديق.", "err");
+    return;
+  }
+  const next = force ?? !state.boxEditMode;
+  if (next) {
+    state.previewTab = "original";
+    if (
+      state.selectedBoxIndex !== null &&
+      state.selectedBoxIndex >= job.analysis.boxes.length
+    ) {
+      state.selectedBoxIndex = null;
+    }
+  }
+  state.boxEditMode = next;
+  refreshAll();
+}
+
+function markBoxDirty(job: PageJob): void {
+  job.dirty = true;
+  if (job.status === "done") job.status = "ready";
+}
+
+function pageSizeFor(job: PageJob): { width: number; height: number } {
+  return {
+    width: Math.max(1, job.width || 1),
+    height: Math.max(1, job.height || 1),
+  };
+}
+
+function pointFromEvent(
+  event: PointerEvent,
+  overlay: HTMLElement,
+  pageWidth: number,
+  pageHeight: number,
+): { x: number; y: number } {
+  const rect = overlay.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return { x: 0, y: 0 };
+  return {
+    x: clamp(((event.clientX - rect.left) / rect.width) * pageWidth, 0, pageWidth),
+    y: clamp(((event.clientY - rect.top) / rect.height) * pageHeight, 0, pageHeight),
+  };
+}
+
+function boxFromPoints(x1: number, y1: number, x2: number, y2: number): Bbox {
+  return {
+    x1: Math.min(x1, x2),
+    y1: Math.min(y1, y2),
+    x2: Math.max(x1, x2),
+    y2: Math.max(y1, y2),
+    confidence: 1,
+    manual: true,
+  };
+}
+
+function applyBoxElementStyle(
+  element: HTMLElement,
+  box: Bbox,
+  pageWidth: number,
+  pageHeight: number,
+): void {
+  const style = boxPositionStyle(box, pageWidth, pageHeight);
+  for (const declaration of style.split(";")) {
+    const [property, value] = declaration.split(":");
+    if (!property || !value) continue;
+    element.style.setProperty(property.trim(), value.trim());
+  }
+}
+
+function moveBoxBy(
+  box: Bbox,
+  dx: number,
+  dy: number,
+  pageWidth: number,
+  pageHeight: number,
+): Bbox {
+  const width = box.x2 - box.x1;
+  const height = box.y2 - box.y1;
+  const x1 = clamp(box.x1 + dx, 0, Math.max(0, pageWidth - width));
+  const y1 = clamp(box.y1 + dy, 0, Math.max(0, pageHeight - height));
+  return { ...box, x1, y1, x2: x1 + width, y2: y1 + height };
+}
+
+function resizeBoxBy(
+  box: Bbox,
+  handle: BoxHandle,
+  dx: number,
+  dy: number,
+  pageWidth: number,
+  pageHeight: number,
+): Bbox {
+  let { x1, y1, x2, y2 } = box;
+  const minWidth = Math.min(BOX_MIN_SIZE, pageWidth);
+  const minHeight = Math.min(BOX_MIN_SIZE, pageHeight);
+  if (handle.includes("w")) x1 = clamp(box.x1 + dx, 0, box.x2 - minWidth);
+  if (handle.includes("e")) x2 = clamp(box.x2 + dx, box.x1 + minWidth, pageWidth);
+  if (handle.includes("n")) y1 = clamp(box.y1 + dy, 0, box.y2 - minHeight);
+  if (handle.includes("s")) y2 = clamp(box.y2 + dy, box.y1 + minHeight, pageHeight);
+  return { ...box, x1, y1, x2, y2 };
+}
+
+function addManualBox(job: PageJob, box: Bbox): void {
+  if (!job.analysis) return;
+  const width = Math.max(1, job.width || 1);
+  const height = Math.max(1, job.height || 1);
+  const manualBox: Bbox = {
+    x1: clamp(box.x1, 0, width),
+    y1: clamp(box.y1, 0, height),
+    x2: clamp(box.x2, 0, width),
+    y2: clamp(box.y2, 0, height),
+    confidence: 1,
+    manual: true,
+  };
+  if (
+    manualBox.x2 - manualBox.x1 < BOX_MIN_SIZE ||
+    manualBox.y2 - manualBox.y1 < BOX_MIN_SIZE
+  ) {
+    return;
+  }
+  job.analysis.boxes.push(manualBox);
+  job.analysis.translations.push("");
+  job.analysis.sourceTexts.push("");
+  state.selectedBoxIndex = job.analysis.boxes.length - 1;
+  markBoxDirty(job);
+  refreshAll();
+  scheduleProjectSave();
+  toast(`أُضيف صندوق يدوي #${job.analysis.boxes.length}.`, "ok", 3000);
+}
+
+function deleteSelectedBox(): void {
+  if (state.busy) return;
+  const job = selectedJob();
+  const index = state.selectedBoxIndex;
+  if (!job?.analysis || index === null) return;
+  if (index < 0 || index >= job.analysis.boxes.length) return;
+  job.analysis.boxes.splice(index, 1);
+  job.analysis.translations.splice(index, 1);
+  job.analysis.sourceTexts.splice(index, 1);
+  state.selectedBoxIndex = job.analysis.boxes.length
+    ? Math.min(index, job.analysis.boxes.length - 1)
+    : null;
+  markBoxDirty(job);
+  refreshAll();
+  scheduleProjectSave();
+  toast("تم حذف الصندوق المحدد.", "ok", 2500);
+}
+
+function nudgeSelectedBox(dx: number, dy: number): void {
+  if (state.busy) return;
+  const job = selectedJob();
+  const index = state.selectedBoxIndex;
+  if (!job?.analysis || index === null) return;
+  const box = job.analysis.boxes[index];
+  if (!box) return;
+  const { width, height } = pageSizeFor(job);
+  const moved = moveBoxBy(box, dx, dy, width, height);
+  if (moved.x1 === box.x1 && moved.y1 === box.y1) return;
+  job.analysis.boxes[index] = moved;
+  markBoxDirty(job);
+  refreshAll();
+  scheduleProjectSave();
+}
+
+function onBoxPointerDown(event: PointerEvent): void {
+  if (state.busy || !state.boxEditMode || event.button !== 0) return;
+  const target = event.target as HTMLElement;
+  const overlay = target.closest<HTMLElement>("#box-overlay");
+  if (!overlay) return;
+  const job = selectedJob();
+  if (!job?.analysis) return;
+
+  const { width, height } = pageSizeFor(job);
+  const point = pointFromEvent(event, overlay, width, height);
+  const handleElement = target.closest<HTMLElement>("[data-handle]");
+  const boxElement = target.closest<HTMLElement>("[data-box-index]");
+  let mode: BoxDragState["mode"] = "draw";
+  let boxIndex: number | null = null;
+  let handle: BoxHandle | null = null;
+  let startBox: Bbox | null = null;
+
+  if (boxElement) {
+    const parsed = Number(boxElement.dataset.boxIndex);
+    if (!Number.isInteger(parsed) || !job.analysis.boxes[parsed]) return;
+    boxIndex = parsed;
+    startBox = { ...job.analysis.boxes[parsed] };
+    if (handleElement) {
+      const candidate = handleElement.dataset.handle as BoxHandle | undefined;
+      if (candidate && (BOX_HANDLES as readonly string[]).includes(candidate)) {
+        mode = "resize";
+        handle = candidate;
+      } else {
+        mode = "move";
+      }
+    } else {
+      mode = "move";
+    }
+  }
+
+  setSelectedBox(boxIndex);
+  let draft: HTMLElement | null = null;
+  if (mode === "draw") {
+    draft = document.createElement("div");
+    draft.className = "box-item box-draft";
+    applyBoxElementStyle(draft, boxFromPoints(point.x, point.y, point.x, point.y), width, height);
+    overlay.appendChild(draft);
+  }
+
+  boxDrag = {
+    mode,
+    pointerId: event.pointerId,
+    jobId: job.id,
+    overlay,
+    boxIndex,
+    handle,
+    startX: point.x,
+    startY: point.y,
+    startBox,
+    currentBox: mode === "draw" ? boxFromPoints(point.x, point.y, point.x, point.y) : startBox,
+    draft,
+    moved: false,
+    pageWidth: width,
+    pageHeight: height,
+  };
+  try {
+    overlay.setPointerCapture(event.pointerId);
+  } catch {
+    // Pointer capture is best-effort; the stage listeners still receive events.
+  }
+  overlay.classList.add("dragging");
+  event.preventDefault();
+}
+
+function onBoxPointerMove(event: PointerEvent): void {
+  const drag = boxDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  const point = pointFromEvent(event, drag.overlay, drag.pageWidth, drag.pageHeight);
+  const dx = point.x - drag.startX;
+  const dy = point.y - drag.startY;
+  let next: Bbox;
+
+  if (drag.mode === "draw") {
+    next = boxFromPoints(drag.startX, drag.startY, point.x, point.y);
+    if (drag.draft) {
+      applyBoxElementStyle(drag.draft, next, drag.pageWidth, drag.pageHeight);
+    }
+    drag.moved = true;
+  } else {
+    if (!drag.startBox) return;
+    next =
+      drag.mode === "move"
+        ? moveBoxBy(drag.startBox, dx, dy, drag.pageWidth, drag.pageHeight)
+        : resizeBoxBy(
+            drag.startBox,
+            drag.handle ?? "se",
+            dx,
+            dy,
+            drag.pageWidth,
+            drag.pageHeight,
+          );
+    const element = drag.overlay.querySelector<HTMLElement>(
+      `[data-box-index="${drag.boxIndex}"]`,
+    );
+    if (element) applyBoxElementStyle(element, next, drag.pageWidth, drag.pageHeight);
+    drag.moved = Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5;
+  }
+
+  drag.currentBox = next;
+  event.preventDefault();
+}
+
+function onBoxPointerUp(event: PointerEvent): void {
+  const drag = boxDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  try {
+    drag.overlay.releasePointerCapture(event.pointerId);
+  } catch {
+    // Ignore a capture that was already released by the browser.
+  }
+  drag.overlay.classList.remove("dragging");
+  drag.draft?.remove();
+  boxDrag = null;
+
+  if (drag.mode === "draw") {
+    if (
+      drag.currentBox &&
+      drag.currentBox.x2 - drag.currentBox.x1 >= BOX_MIN_SIZE &&
+      drag.currentBox.y2 - drag.currentBox.y1 >= BOX_MIN_SIZE
+    ) {
+      const job = state.pages.find((page) => page.id === drag.jobId);
+      if (job) addManualBox(job, drag.currentBox);
+    }
+    event.preventDefault();
+    return;
+  }
+
+  if (!drag.moved || !drag.currentBox || drag.boxIndex === null) return;
+  const job = state.pages.find((page) => page.id === drag.jobId);
+  if (!job?.analysis) return;
+  const original = job.analysis.boxes[drag.boxIndex];
+  if (!original) return;
+  job.analysis.boxes[drag.boxIndex] = { ...original, ...drag.currentBox };
+  markBoxDirty(job);
+  refreshAll();
+  scheduleProjectSave();
+  event.preventDefault();
+}
+
+function onBoxPointerCancel(event: PointerEvent): void {
+  const drag = boxDrag;
+  if (!drag || event.pointerId !== drag.pointerId) return;
+  drag.overlay.classList.remove("dragging");
+  drag.draft?.remove();
+  boxDrag = null;
+}
+
+function handleBoxEditorKeyDown(event: KeyboardEvent): void {
+  if (state.busy || !state.boxEditMode || boxDrag) return;
+  const target = event.target as HTMLElement;
+  if (
+    target instanceof HTMLInputElement ||
+    target instanceof HTMLTextAreaElement ||
+    target instanceof HTMLSelectElement ||
+    target.isContentEditable
+  ) {
+    return;
+  }
+
+  if (event.key === "Delete" || event.key === "Backspace") {
+    if (state.selectedBoxIndex !== null) {
+      event.preventDefault();
+      deleteSelectedBox();
+    }
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    if (state.selectedBoxIndex !== null) {
+      setSelectedBox(null);
+    } else {
+      state.boxEditMode = false;
+      refreshAll();
+    }
+    return;
+  }
+  if (event.key.startsWith("Arrow") && state.selectedBoxIndex !== null) {
+    event.preventDefault();
+    const step = event.shiftKey ? 10 : 1;
+    if (event.key === "ArrowLeft") nudgeSelectedBox(-step, 0);
+    if (event.key === "ArrowRight") nudgeSelectedBox(step, 0);
+    if (event.key === "ArrowUp") nudgeSelectedBox(0, -step);
+    if (event.key === "ArrowDown") nudgeSelectedBox(0, step);
+  }
+}
+
 async function runTask(label: string, task: () => Promise<void>): Promise<void> {
   if (state.busy) {
     toast("هناك عملية قيد التنفيذ بالفعل. انتظر حتى تنتهي.", "err");
@@ -819,11 +1519,12 @@ async function runTask(label: string, task: () => Promise<void>): Promise<void> 
   }
   state.busy = true;
   state.status = label;
-  state.progress = Math.max(state.progress, 2);
+  state.progress = 2;
   refreshAll();
 
   try {
     await task();
+    state.progress = 100;
   } catch (err) {
     state.status = "توقف التنفيذ بسبب خطأ.";
     toast(errorMessage(err), "err", 7000);
@@ -833,10 +1534,266 @@ async function runTask(label: string, task: () => Promise<void>): Promise<void> 
   }
 }
 
+function cloneAnalysis(analysis: PageAnalysis | null): PageAnalysis | null {
+  if (!analysis) return null;
+  if (typeof structuredClone === "function") return structuredClone(analysis);
+  return JSON.parse(JSON.stringify(analysis)) as PageAnalysis;
+}
+
+function buildProjectSnapshot(): ProjectSnapshot {
+  return {
+    version: PROJECT_VERSION,
+    savedAt: Date.now(),
+    selectedId: state.selectedId,
+    settings: projectSettingsFromApp(state.settings),
+    pages: state.pages.map((job) => ({
+      id: job.id,
+      name: job.name,
+      width: job.width,
+      height: job.height,
+      status: projectStatus(job.status),
+      stage: job.stage,
+      error: job.error,
+      dirty: job.dirty,
+      analysis: cloneAnalysis(job.analysis),
+      image: job.file,
+      imageType: job.file.type || "image/png",
+    })),
+  };
+}
+
+function scheduleProjectSave(delay = 650): void {
+  if (state.restoringProject) return;
+  if (projectSaveTimer !== null) window.clearTimeout(projectSaveTimer);
+  projectSaveTimer = window.setTimeout(() => {
+    projectSaveTimer = null;
+    void saveProjectNow(true);
+  }, delay);
+}
+
+async function saveProjectNow(silent = true): Promise<boolean> {
+  if (state.restoringProject) return false;
+  if (projectSaveTimer !== null) {
+    window.clearTimeout(projectSaveTimer);
+    projectSaveTimer = null;
+  }
+  if (projectSavePromise) {
+    projectSaveQueued = true;
+    const result = await projectSavePromise;
+    if (projectSaveQueued) {
+      projectSaveQueued = false;
+      return saveProjectNow(silent);
+    }
+    return result;
+  }
+  projectSaveQueued = false;
+
+  let snapshot: ProjectSnapshot;
+  try {
+    snapshot = buildProjectSnapshot();
+  } catch (error) {
+    state.projectError = errorMessage(error);
+    renderProjectState();
+    if (!silent) toast(state.projectError, "err", 7000);
+    return false;
+  }
+
+  state.projectSaving = true;
+  state.projectError = "";
+  renderProjectState();
+
+  projectSavePromise = (async () => {
+    try {
+      await saveProjectSnapshot(snapshot);
+      state.projectSavedAt = snapshot.savedAt;
+      state.projectError = "";
+      return true;
+    } catch (error) {
+      state.projectError = errorMessage(error);
+      if (!silent) toast(state.projectError, "err", 8000);
+      return false;
+    } finally {
+      state.projectSaving = false;
+      renderProjectState();
+      projectSavePromise = null;
+    }
+  })();
+
+  return projectSavePromise;
+}
+
+async function saveProjectManually(): Promise<void> {
+  const saved = await saveProjectNow(false);
+  if (saved) toast("تم حفظ المشروع في هذا المتصفح.", "ok");
+}
+
+async function exportProject(): Promise<void> {
+  if (state.pages.length === 0) {
+    toast("أضف صفحات أولًا لتصدير المشروع.", "err");
+    return;
+  }
+  await runTask("تجهيز ملف المشروع…", async () => {
+    const snapshot = buildProjectSnapshot();
+    const blob = await exportProjectFile(snapshot);
+    const date = new Date().toISOString().slice(0, 10);
+    downloadBlob(blob, `manga-psd-project-${date}.${PROJECT_FILE_EXTENSION}`);
+    state.progress = 100;
+    state.status = "تم تصدير ملف المشروع.";
+    toast("تم تصدير ملف المشروع. لا يحتوي مفاتيح API أو ملفات الخطوط المخصصة.", "ok", 7000);
+  });
+}
+
+async function jobsFromProjectPages(pages: ProjectPage[]): Promise<PageJob[]> {
+  const jobs: PageJob[] = [];
+  for (const page of pages) {
+    const imageType = page.imageType || page.image.type || "image/png";
+    const file = new File([page.image], page.name, { type: imageType });
+    const url = URL.createObjectURL(file);
+    let width = page.width;
+    let height = page.height;
+    if (!width || !height) {
+      const meta = await loadImageMeta(url).catch(() => ({ width: 0, height: 0 }));
+      width = meta.width;
+      height = meta.height;
+    }
+    const analysis = cloneAnalysis(page.analysis);
+    jobs.push({
+      id: page.id,
+      file,
+      name: page.name,
+      url,
+      width,
+      height,
+      status: page.status === "error" ? "error" : analysis ? "ready" : "queued",
+      stage: analysis ? "تم استئناف المشروع — أعد التركيب" : page.stage,
+      error: page.error,
+      analysis,
+      render: null,
+      dirty: Boolean(analysis && analysis.translations.some((text) => text.trim())),
+    });
+  }
+  return jobs;
+}
+
+function bumpNextId(pages: PageJob[]): void {
+  for (const page of pages) {
+    const match = /^page-(\d+)$/.exec(page.id);
+    if (match) nextId = Math.max(nextId, Number(match[1]) + 1);
+  }
+}
+
+async function restoreProject(): Promise<void> {
+  state.restoringProject = true;
+  let needsSave = false;
+  try {
+    const snapshot = await loadProjectSnapshot();
+    if (!snapshot || snapshot.pages.length === 0) return;
+
+    const jobs = await jobsFromProjectPages(snapshot.pages);
+    if (jobs.length === 0) return;
+
+    const nextSettings = applyProjectSettings(state.settings, snapshot.settings);
+    const fontAvailable = allFontPresets().some((font) => font.id === nextSettings.fontId);
+    if (!fontAvailable) {
+      nextSettings.fontId = FONT_PRESETS[0].id;
+      needsSave = true;
+    }
+    state.settings = nextSettings;
+    saveSettings(state.settings);
+
+    state.pages = jobs;
+    state.selectedId = jobs.some((job) => job.id === snapshot.selectedId)
+      ? snapshot.selectedId
+      : jobs[0].id;
+    bumpNextId(jobs);
+    state.projectSavedAt = snapshot.savedAt;
+    state.projectError = "";
+    state.status = `تم استئناف مشروع محفوظ: ${jobs.length} صفحة.`;
+    toast(`تم استئناف المشروع المحفوظ (${jobs.length} صفحة).`, "ok", 6000);
+    if (!fontAvailable) {
+      toast("الخط المخصص المحفوظ في المشروع غير موجود في هذا المتصفح؛ تم استخدام الخط الافتراضي.", "err", 8000);
+    }
+  } catch (error) {
+    state.projectError = errorMessage(error);
+    toast(`تعذّر استئناف المشروع المحفوظ: ${state.projectError}`, "err", 8000);
+  } finally {
+    state.restoringProject = false;
+  }
+  if (needsSave) scheduleProjectSave(900);
+}
+
+async function importProjectFromFile(file: File): Promise<void> {
+  if (state.busy) {
+    toast("انتظر انتهاء العملية الحالية قبل استيراد مشروع.", "err");
+    return;
+  }
+  if (
+    state.pages.length > 0 &&
+    !window.confirm("استيراد مشروع سيستبدل الصفحات الحالية غير المحفوظة في التطبيق. هل تريد المتابعة؟")
+  ) {
+    return;
+  }
+
+  await runTask("استيراد المشروع…", async () => {
+    const snapshot = await importProjectFile(file);
+    if (snapshot.pages.length === 0) {
+      throw new Error("المشروع لا يحتوي على صفحات.");
+    }
+    const jobs = await jobsFromProjectPages(snapshot.pages);
+    if (jobs.length === 0) throw new Error("تعذّر تحميل صور المشروع.");
+
+    const nextSettings = applyProjectSettings(state.settings, snapshot.settings);
+    const fontAvailable = allFontPresets().some((font) => font.id === nextSettings.fontId);
+    if (!fontAvailable) nextSettings.fontId = FONT_PRESETS[0].id;
+
+    for (const page of state.pages) URL.revokeObjectURL(page.url);
+    state.settings = nextSettings;
+    saveSettings(state.settings);
+    state.pages = jobs;
+    state.selectedId = jobs.some((job) => job.id === snapshot.selectedId)
+      ? snapshot.selectedId
+      : jobs[0].id;
+    bumpNextId(jobs);
+    state.previewTab = "original";
+    state.boxEditMode = false;
+    state.selectedBoxIndex = null;
+    state.projectSavedAt = null;
+    state.projectError = "";
+    state.progress = 100;
+    state.status = `تم استيراد المشروع: ${jobs.length} صفحة.`;
+
+    await saveProjectNow(true);
+    if (!fontAvailable) {
+      toast("خط المشروع المخصص غير موجود في هذا المتصفح؛ تم استخدام الخط الافتراضي.", "err", 8000);
+    }
+    toast(`تم استيراد المشروع (${jobs.length} صفحة). أعد التركيب لإنشاء PSD.`, "ok", 7000);
+  });
+}
+
+const IMAGE_EXTENSION_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+  avif: "image/avif",
+};
+
+function normalizedImageType(file: File): string | null {
+  if (SUPPORTED_IMAGE_TYPES.has(file.type)) return file.type;
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+  return IMAGE_EXTENSION_TYPES[extension] ?? null;
+}
+
 async function addFiles(files: FileList | File[]): Promise<void> {
-  const list = Array.from(files).filter((file) => file.type.startsWith("image/"));
+  const list: File[] = [];
+  for (const file of Array.from(files)) {
+    const type = normalizedImageType(file);
+    if (!type) continue;
+    list.push(file.type === type ? file : new File([file], file.name, { type }));
+  }
   if (list.length === 0) {
-    toast("اختر صور PNG أو JPG أو WebP.", "err");
+    toast("اختر صور PNG أو JPG أو WebP أو GIF أو AVIF.", "err");
     return;
   }
 
@@ -863,15 +1820,19 @@ async function addFiles(files: FileList | File[]): Promise<void> {
 
   state.status = `تمت إضافة ${list.length} صفحة.`;
   refreshAll();
+  scheduleProjectSave();
   toast(`تمت إضافة ${list.length} صفحة.`, "ok");
 }
 
 function selectJob(id: string): void {
   if (!state.pages.some((page) => page.id === id)) return;
   state.selectedId = id;
+  state.selectedBoxIndex = null;
   const job = selectedJob();
   if (job && !job.render && state.previewTab !== "original") state.previewTab = "original";
+  if (job && !job.analysis) state.boxEditMode = false;
   refreshAll();
+  scheduleProjectSave();
 }
 
 function removeJob(id: string): void {
@@ -887,8 +1848,11 @@ function removeJob(id: string): void {
   if (state.selectedId === id) {
     state.selectedId = state.pages[Math.min(index, state.pages.length - 1)]?.id ?? null;
   }
+  state.selectedBoxIndex = null;
+  if (!selectedJob()?.analysis) state.boxEditMode = false;
   state.status = "تم حذف الصفحة.";
   refreshAll();
+  scheduleProjectSave();
 }
 
 function clearAll(): void {
@@ -901,9 +1865,12 @@ function clearAll(): void {
   for (const page of state.pages) URL.revokeObjectURL(page.url);
   state.pages = [];
   state.selectedId = null;
+  state.selectedBoxIndex = null;
+  state.boxEditMode = false;
   state.progress = 0;
   state.status = "تم مسح القائمة.";
   refreshAll();
+  scheduleProjectSave(150);
 }
 
 async function downloadSelected(): Promise<void> {
@@ -1018,6 +1985,7 @@ function markRendersDirty(): void {
     job.dirty = true;
     if (job.status === "done") job.status = "ready";
   }
+  scheduleProjectSave();
 }
 
 function selectCustomFont(id: string): void {
@@ -1036,6 +2004,7 @@ function selectCustomFont(id: string): void {
   markRendersDirty();
   renderSettings();
   refreshAll();
+  scheduleProjectSave();
   toast(`تم اختيار الخط «${preset.label}». أعد تركيب الصفحات لتطبيقه على PSD.`, "ok", 6000);
 }
 
@@ -1069,6 +2038,7 @@ async function deleteCustomFont(id: string): Promise<void> {
   }
   renderSettings();
   refreshAll();
+  scheduleProjectSave();
   toast(`تم حذف الخط «${info.label}».`, "ok");
 }
 
@@ -1088,6 +2058,7 @@ async function addCustomFontFromFile(file: File): Promise<void> {
     markRendersDirty();
     renderSettings();
     refreshAll();
+    scheduleProjectSave();
     toast(`تمت إضافة الخط «${info.label}» واختياره.`, "ok", 6500);
   } catch (error) {
     const message = errorMessage(error);
@@ -1144,6 +2115,18 @@ function bindEvents(): void {
   document.getElementById("download-all")?.addEventListener("click", () => void downloadAll());
   document.getElementById("clear-all")?.addEventListener("click", clearAll);
 
+  document.getElementById("save-project")?.addEventListener("click", () => void saveProjectManually());
+  document.getElementById("export-project")?.addEventListener("click", () => void exportProject());
+  const projectInput = document.getElementById("project-input") as HTMLInputElement | null;
+  document.getElementById("import-project")?.addEventListener("click", () => projectInput?.click());
+  projectInput?.addEventListener("change", () => {
+    const file = projectInput.files?.[0];
+    projectInput.value = "";
+    if (file) void importProjectFromFile(file);
+  });
+
+  document.getElementById("toggle-box-editor")?.addEventListener("click", () => toggleBoxEditor());
+
   document.getElementById("pages-grid")?.addEventListener("click", (event) => {
     const target = event.target as HTMLElement;
     const card = target.closest<HTMLElement>("[data-page-id]");
@@ -1178,25 +2161,55 @@ function bindEvents(): void {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-tab]");
     if (!button || button.disabled) return;
     state.previewTab = button.dataset.tab as PreviewTab;
+    if (state.previewTab !== "original") state.boxEditMode = false;
     renderPreview();
+    renderTranslations();
   });
 
   document.getElementById("preview-side")?.addEventListener("click", (event) => {
-    const action = (event.target as HTMLElement).closest<HTMLElement>("[data-preview-action]")?.dataset
+    const target = event.target as HTMLElement;
+    const action = target.closest<HTMLElement>("[data-preview-action]")?.dataset
       .previewAction;
     if (action === "psd") void downloadSelected();
     if (action === "png") void downloadPng();
+    if (action === "edit-boxes") toggleBoxEditor();
     if (action === "render") {
       const job = selectedJob();
       if (job) void runTask(`تركيب ${job.name}…`, () => doRender(job));
     }
+    const boxAction = target.closest<HTMLElement>("[data-box-action]")?.dataset.boxAction;
+    if (boxAction === "delete") deleteSelectedBox();
+    if (boxAction === "translate") void retranslateSelected();
+  });
+
+  document.getElementById("translations-body")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    const row = target.closest<HTMLElement>("tr[data-box-index]");
+    if (!row) return;
+    const index = Number(row.dataset.boxIndex);
+    if (Number.isInteger(index)) setSelectedBox(index);
   });
 
   document.getElementById("translations-body")?.addEventListener("input", (event) => {
-    const textarea = (event.target as HTMLElement).closest<HTMLTextAreaElement>("textarea[data-index]");
-    if (!textarea) return;
+    const target = event.target as HTMLElement;
     const job = selectedJob();
     if (!job?.analysis) return;
+
+    const source = target.closest<HTMLTextAreaElement>("textarea[data-source-index]");
+    if (source) {
+      const index = Number(source.dataset.sourceIndex);
+      if (!Number.isInteger(index) || index < 0) return;
+      job.analysis.sourceTexts[index] = source.value;
+      job.dirty = true;
+      if (job.status === "done") job.status = "ready";
+      renderPreview();
+      renderStatus();
+      scheduleProjectSave();
+      return;
+    }
+
+    const textarea = target.closest<HTMLTextAreaElement>("textarea[data-index]");
+    if (!textarea) return;
     const index = Number(textarea.dataset.index);
     if (!Number.isInteger(index) || index < 0) return;
     job.analysis.translations[index] = textarea.value;
@@ -1204,11 +2217,29 @@ function bindEvents(): void {
     if (job.status === "done") job.status = "ready";
     renderPreview();
     renderStatus();
+    scheduleProjectSave();
+  });
+
+  const previewStage = document.getElementById("preview-stage");
+  previewStage?.addEventListener("pointerdown", onBoxPointerDown);
+  previewStage?.addEventListener("pointermove", onBoxPointerMove);
+  previewStage?.addEventListener("pointerup", onBoxPointerUp);
+  previewStage?.addEventListener("pointercancel", onBoxPointerCancel);
+  document.addEventListener("keydown", handleBoxEditorKeyDown);
+
+  window.addEventListener("beforeunload", () => {
+    void saveProjectNow(true);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void saveProjectNow(true);
   });
 
   document.getElementById("reanalyze-selected")?.addEventListener("click", () => {
     const job = selectedJob();
     if (job) void runTask(`إعادة تحليل ${job.name}…`, () => doAnalyze(job));
+  });
+  document.getElementById("retranslate-selected")?.addEventListener("click", () => {
+    void retranslateSelected();
   });
   document.getElementById("render-selected")?.addEventListener("click", () => {
     const job = selectedJob();
@@ -1254,7 +2285,8 @@ function bindEvents(): void {
     if (!key) return;
     updateSetting(key, target);
     if (key === "engine" || key === "fontId") renderSettings();
-    if (RENDER_SETTING_KEYS.has(key)) refreshAll();
+    if (key === "engine" || RENDER_SETTING_KEYS.has(key)) refreshAll();
+    else updateControls();
   });
 }
 
@@ -1278,6 +2310,7 @@ function updateSetting(key: keyof AppSettings, target: HTMLInputElement | HTMLSe
   (state.settings as unknown as Record<string, unknown>)[key] = value;
   saveSettings(state.settings);
   if (previous !== value && RENDER_SETTING_KEYS.has(key)) markRendersDirty();
+  scheduleProjectSave();
 }
 
 async function main(): Promise<void> {
@@ -1288,13 +2321,17 @@ async function main(): Promise<void> {
     saveSettings(state.settings);
   }
   renderShell();
+  await restoreProject();
+  bindEvents();
+  const restoredFont = selectedFont(state.settings);
+  if (restoredFont.id !== state.settings.fontId) {
+    state.settings.fontId = restoredFont.id;
+    saveSettings(state.settings);
+  }
   renderSettings();
   renderHelp();
-  renderPages();
-  renderPreview();
-  renderTranslations();
-  renderStatus();
-  bindEvents();
+  refreshAll();
+  renderProjectState();
 }
 
 void main();
