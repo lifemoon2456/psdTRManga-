@@ -23,7 +23,7 @@ const PROJECT_DB_VERSION = 1;
 const PROJECT_STORE_NAME = "projects";
 const CURRENT_PROJECT_ID = "current";
 const MANIFEST_NAME = "project.json";
-const MAX_PAGES = 500;
+export const MAX_PROJECT_PAGES = 500;
 const MAX_PROJECT_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_PAGE_BYTES = 150 * 1024 * 1024;
 
@@ -328,8 +328,8 @@ export function projectStatus(status: string): ProjectPageStatus {
 }
 
 export async function exportProjectFile(snapshot: ProjectSnapshot): Promise<Blob> {
-  if (snapshot.pages.length > MAX_PAGES) {
-    throw new Error(`لا يمكن تصدير أكثر من ${MAX_PAGES} صفحة في مشروع واحد.`);
+  if (snapshot.pages.length > MAX_PROJECT_PAGES) {
+    throw new Error(`لا يمكن تصدير أكثر من ${MAX_PROJECT_PAGES} صفحة في مشروع واحد.`);
   }
 
   const zip = new JSZip();
@@ -403,8 +403,8 @@ export async function importProjectFile(file: File): Promise<ProjectSnapshot> {
   if (version !== PROJECT_VERSION) {
     throw new Error(`إصدار المشروع غير مدعوم: ${String(manifest.version)}.`);
   }
-  if (!Array.isArray(manifest.pages) || manifest.pages.length > MAX_PAGES) {
-    throw new Error(`عدد الصفحات غير صالح أو يتجاوز ${MAX_PAGES}.`);
+  if (!Array.isArray(manifest.pages) || manifest.pages.length > MAX_PROJECT_PAGES) {
+    throw new Error(`عدد الصفحات غير صالح أو يتجاوز ${MAX_PROJECT_PAGES}.`);
   }
 
   const pages: ProjectPage[] = [];

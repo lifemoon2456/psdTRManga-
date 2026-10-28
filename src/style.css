@@ -159,6 +159,7 @@ button.small { padding: 6px 10px; font-size: 12px; border-radius: 8px; }
 .dropzone.drag { border-color: var(--accent); background: rgba(139,124,255,.12); }
 .dropzone h3 { margin: 0 0 6px; font-size: 16px; }
 .dropzone p { margin: 0 0 16px; color: var(--muted); font-size: 13px; }
+.dropzone-actions { display: flex; justify-content: center; gap: 8px; flex-wrap: wrap; }
 .dropzone .hint { color: var(--muted-2); font-size: 11px; margin-top: 12px; }
 
 .pages-grid {
@@ -490,6 +491,7 @@ table.translations textarea:focus { outline: none; border-color: var(--accent); 
   .topbar { flex-direction: column; align-items: stretch; }
   .top-actions { justify-content: stretch; }
   .top-actions button { flex: 1; }
+  .dropzone-actions button { flex: 1; }
   .project-bar { flex-direction: column; align-items: stretch; }
   .project-bar-actions { justify-content: stretch; }
   .project-bar-actions button { flex: 1; }

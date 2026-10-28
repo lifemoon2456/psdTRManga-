@@ -23,6 +23,7 @@ import {
   exportProjectFile,
   importProjectFile,
   loadProjectSnapshot,
+  MAX_PROJECT_PAGES,
   projectSettingsFromApp,
   projectStatus,
   saveProjectSnapshot,
@@ -69,12 +70,16 @@ const state = {
   projectSavedAt: null as number | null,
   projectError: "",
   restoringProject: false,
+  batchIndex: 0,
+  batchTotal: 0,
+  batchPhase: "analyze" as "analyze" | "render",
 };
 
 let nextId = 1;
 let projectSaveTimer: number | null = null;
 let projectSavePromise: Promise<boolean> | null = null;
 let projectSaveQueued = false;
+const importedPaths = new WeakMap<File, string>();
 
 const BOX_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"] as const;
 type BoxHandle = (typeof BOX_HANDLES)[number];
@@ -126,6 +131,13 @@ function errorMessage(err: unknown): string {
   return String(err);
 }
 
+function pageCountText(count: number, genitive = false): string {
+  if (count === 1) return "صفحة واحدة";
+  if (count === 2) return genitive ? "صفحتين" : "صفحتان";
+  if (count >= 3 && count <= 10) return `${count} صفحات`;
+  return `${count} صفحة`;
+}
+
 function renderShell(): void {
   const root = document.getElementById("app");
   if (!root) throw new Error("Missing #app");
@@ -141,9 +153,9 @@ function renderShell(): void {
           </div>
         </div>
         <div class="top-actions">
-          <button id="analyze-all" class="ghost">تحليل الكل</button>
-          <button id="process-all" class="primary">معالجة الكل</button>
-          <button id="download-all">تنزيل كل PSD</button>
+          <button id="analyze-all" class="ghost" title="تحليل وترجمة كل الصفحات دون تركيب PSD">تحليل الكل</button>
+          <button id="process-all" class="primary" title="تحليل وترجمة وتركيب PSD لكل الصفحات">ترجمة الكل</button>
+          <button id="download-all" title="تنزيل كل الصفحات المعالجة كملف ZIP">تنزيل كل PSD</button>
         </div>
       </header>
 
@@ -173,13 +185,25 @@ function renderShell(): void {
               <span class="badge">صور PNG / JPG / WebP / GIF / AVIF</span>
             </div>
             <div class="panel-body">
-              <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="اختيار صفحات مانجا">
-                <h3>اسحب صفحات المانجا هنا أو اضغط للاختيار</h3>
-                <p>يمكنك اختيار عدة صفحات مرة واحدة. الصفحات لا تُرفع إلى أي خادم من هذا التطبيق.</p>
-                <button type="button" class="primary" id="pick-files">اختيار الصفحات</button>
+              <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="اختيار صفحات مانجا أو مجلد كامل">
+                <h3>اسحب صفحات المانجا أو مجلدًا كاملًا هنا</h3>
+                <p>اختر مجلد الصفحات أو عدة صور مرة واحدة. الصفحات لا تُرفع إلى أي خادم من هذا التطبيق.</p>
+                <div class="dropzone-actions">
+                  <button type="button" class="primary" id="pick-files">اختيار الصفحات</button>
+                  <button type="button" id="pick-folder">اختيار مجلد</button>
+                </div>
+                <div class="hint">تُرتّب الصفحات تلقائيًا حسب اسم الملف. بعد إضافة المجلد اضغط «ترجمة الكل» في الأعلى.</div>
                 <div class="hint">أول تشغيل قد ينزّل موديلات الكشف والتنظيف. انتظر حتى يكتمل التنزيل.</div>
               </div>
               <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/avif" multiple hidden />
+              <input
+                id="folder-input"
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/gif,image/avif"
+                webkitdirectory
+                multiple
+                hidden
+              />
 
               <div style="margin-top: 14px">
                 <div class="status-line">
@@ -195,7 +219,8 @@ function renderShell(): void {
             <div class="panel-head">
               <h2>الصفحات <span id="page-count" class="badge">0</span></h2>
               <div style="display:flex; gap:6px; flex-wrap:wrap">
-                <button class="small" id="add-more">إضافة</button>
+                <button class="small" id="add-folder">إضافة مجلد</button>
+                <button class="small" id="add-more">إضافة صور</button>
                 <button class="small danger" id="clear-all">مسح الكل</button>
               </div>
             </div>
@@ -521,14 +546,19 @@ function renderHelp(): void {
   if (!body) return;
   body.innerHTML = `
     <ol style="margin:0; padding-inline-start:18px; color:var(--muted); font-size:12px; line-height:1.9">
-      <li>أضف صفحات المانجا (يفضل دقة عالية).</li>
-      <li>اختر لغة المصدر ومحرك الترجمة، ثم «تحليل الكل».</li>
+      <li>أضف صفحات المانجا: اختر عدة صور، أو اختر مجلدًا كاملًا، أو أفلت المجلد في منطقة الإضافة. تُرتّب الصفحات تلقائيًا حسب اسم الملف.</li>
+      <li>اختر لغة المصدر ومحرك الترجمة من الإعدادات.</li>
       <li>اختر خط النص من الإعدادات، أو أضف خطك الخاص (TTF / OTF / WOFF / WOFF2).</li>
+      <li>اضغط «ترجمة الكل» لتحليل كل الصفحات وترجمتها وتركيب PSD لها دفعة واحدة، أو «تحليل الكل» للتحليل والترجمة دون تركيب PSD.</li>
       <li>راجع النص الأصلي والترجمة في الجدول وعدّل ما تريد.</li>
       <li>استخدم «تحرير الصناديق» لإضافة صندوق فات من الكشف أو تصحيح موضع/حجم صندوق.</li>
-      <li>اضغط «تركيب وتحديث PSD» ثم نزّل الملف.</li>
+      <li>بعد اكتمال التركيب، نزّل الصفحة الحالية أو استخدم «تنزيل كل PSD» لتنزيل جميع الصفحات في ملف ZIP.</li>
     </ol>
     <div class="divider"></div>
+    <div class="notice info" style="margin-bottom:10px">
+      <strong>مجلد كامل بضغطة واحدة:</strong> اضغط «اختيار مجلد» ثم «ترجمة الكل». سيعالج التطبيق
+      الصفحات بالترتيب دون الحاجة لفتح كل صفحة وتشغيلها يدويًا.
+    </div>
     <div class="notice info" style="margin-bottom:10px">
       <strong>الحفظ التلقائي:</strong> تُحفظ الصفحات والصناديق والترجمات في IndexedDB داخل هذا المتصفح.
       زر «حفظ الآن» يكتب فورًا، و«تصدير المشروع» ينشئ ملف <code>.mpsproj</code> يمكن استيراده لاحقًا.
@@ -946,6 +976,9 @@ function updateControls(): void {
   setDisabled("process-all", state.busy || !hasPages);
   setDisabled("download-all", state.busy || !hasPages);
   setDisabled("clear-all", state.busy || !hasPages);
+  setDisabled("pick-files", state.busy);
+  setDisabled("pick-folder", state.busy);
+  setDisabled("add-folder", state.busy);
   setDisabled("add-more", state.busy);
   setDisabled("reanalyze-selected", state.busy || !job);
   setDisabled(
@@ -968,11 +1001,41 @@ function updateControls(): void {
     toggle.classList.toggle("primary", state.boxEditMode);
     toggle.setAttribute("aria-pressed", String(state.boxEditMode));
   }
+
+  const processButton = document.getElementById("process-all");
+  if (processButton) {
+    const manual = state.settings.engine === "manual";
+    processButton.textContent = manual ? "تركيب الكل" : "ترجمة الكل";
+    processButton.title = manual
+      ? "تحليل الصفحات وتركيب PSD للصفحات التي تحتوي ترجمات"
+      : "تحليل كل الصفحات وترجمتها وتركيب PSD لها دفعة واحدة";
+  }
+  const analyzeButton = document.getElementById("analyze-all");
+  if (analyzeButton) {
+    analyzeButton.title =
+      state.settings.engine === "manual"
+        ? "كشف مناطق النص فقط في كل الصفحات دون تركيب PSD"
+        : "تحليل وترجمة كل الصفحات دون تركيب PSD";
+  }
+
   updateBoxEditorSelectionUi();
 }
 
+function batchProgress(localPercent: number): number {
+  if (state.batchTotal <= 0) return localPercent;
+  const clamped = clamp(localPercent, 0, 100);
+  const phaseStart = state.batchPhase === "render" ? 45 : 0;
+  const phaseSpan = state.batchPhase === "render" ? 55 : 45;
+  const pageFraction = (phaseStart + (clamped / 100) * phaseSpan) / 100;
+  return ((state.batchIndex + pageFraction) / state.batchTotal) * 100;
+}
+
+function setProgressPercent(localPercent: number): void {
+  state.progress = batchProgress(localPercent);
+}
+
 function setProgress(stage: PipelineStage, message?: string): void {
-  state.progress = STAGE_PROGRESS[stage] ?? state.progress;
+  setProgressPercent(STAGE_PROGRESS[stage] ?? 0);
   if (message) state.status = message;
   renderStatus();
 }
@@ -995,6 +1058,7 @@ async function doAnalyze(job: PageJob): Promise<void> {
   const settingsError = validateSettings(state.settings);
   if (settingsError) throw new Error(settingsError);
 
+  state.batchPhase = "analyze";
   job.status = "analyzing";
   job.error = "";
   job.stage = "تهيئة الكشف…";
@@ -1002,7 +1066,7 @@ async function doAnalyze(job: PageJob): Promise<void> {
   job.dirty = false;
   state.boxEditMode = false;
   state.selectedBoxIndex = null;
-  state.progress = 0;
+  setProgressPercent(0);
   state.status = `تحليل ${job.name}…`;
   refreshAll();
 
@@ -1018,7 +1082,7 @@ async function doAnalyze(job: PageJob): Promise<void> {
       analysis.boxes.length > 0
         ? `${analysis.boxes.length} منطقة نص`
         : "لم يتم العثور على نص";
-    state.progress = 100;
+    setProgressPercent(100);
     state.status =
       analysis.boxes.length > 0
         ? `تم تحليل ${job.name}: ${analysis.boxes.length} منطقة.`
@@ -1030,7 +1094,7 @@ async function doAnalyze(job: PageJob): Promise<void> {
     job.status = "error";
     job.error = errorMessage(err);
     job.stage = "";
-    state.progress = 0;
+    setProgressPercent(0);
     state.status = `فشل تحليل ${job.name}.`;
     throw err;
   } finally {
@@ -1052,12 +1116,13 @@ async function doRender(job: PageJob): Promise<void> {
     throw new Error("لا توجد ترجمات غير فارغة. عدّل الجدول أو أعد التحليل أولًا.");
   }
 
+  state.batchPhase = "render";
   job.status = "rendering";
   job.error = "";
   job.stage = "تنظيف الصفحة…";
   state.boxEditMode = false;
   state.selectedBoxIndex = null;
-  state.progress = 0;
+  setProgressPercent(0);
   state.status = `تركيب ${job.name}…`;
   refreshAll();
 
@@ -1077,13 +1142,13 @@ async function doRender(job: PageJob): Promise<void> {
     job.status = "done";
     job.stage = "PSD جاهز";
     state.previewTab = "final";
-    state.progress = 100;
+    setProgressPercent(100);
     state.status = `تم إنشاء PSD لـ ${job.name}.`;
   } catch (err) {
     job.status = "error";
     job.error = errorMessage(err);
     job.stage = "";
-    state.progress = 0;
+    setProgressPercent(0);
     state.status = `فشل تركيب ${job.name}.`;
     throw err;
   } finally {
@@ -1101,6 +1166,45 @@ async function ensureRender(job: PageJob): Promise<void> {
   if (!job.render || job.dirty) await doRender(job);
 }
 
+function pageHasTranslations(job: PageJob): boolean {
+  return Boolean(job.analysis?.translations.some((text) => text.trim()));
+}
+
+async function translateJob(job: PageJob): Promise<void> {
+  if (!job.analysis) throw new Error("حلل الصفحة أولًا قبل ترجمة المناطق.");
+  if (state.settings.engine === "manual") {
+    throw new Error("الوضع اليدوي لا يستدعي مزود ترجمة.");
+  }
+  if (job.analysis.boxes.length === 0) return;
+
+  state.batchPhase = "analyze";
+  setProgressPercent(44);
+  job.stage = "ترجمة المناطق الحالية…";
+  refreshProgress();
+  try {
+    const result = await translatePage(
+      job.url,
+      job.analysis.boxes,
+      toPipelineSettings(state.settings).translation,
+    );
+    job.analysis.translations = job.analysis.boxes.map(
+      (_, index) => result.translations[index] ?? "",
+    );
+    job.analysis.sourceTexts = job.analysis.boxes.map(
+      (_, index) => result.sourceTexts?.[index] ?? "",
+    );
+    job.dirty = true;
+    if (job.status === "done") job.status = "ready";
+    job.stage = `${job.analysis.boxes.length} منطقة مترجمة`;
+    setProgressPercent(100);
+    state.status = `تمت ترجمة مناطق ${job.name}.`;
+    scheduleProjectSave();
+  } catch (error) {
+    job.stage = "فشلت ترجمة المناطق";
+    throw error;
+  }
+}
+
 async function retranslateSelected(): Promise<void> {
   const job = selectedJob();
   if (!job?.analysis) {
@@ -1115,9 +1219,8 @@ async function retranslateSelected(): Promise<void> {
     toast("لا توجد مناطق نص لترجمتها.", "err");
     return;
   }
-  const hasTranslations = job.analysis.translations.some((text) => text.trim());
   if (
-    hasTranslations &&
+    pageHasTranslations(job) &&
     !window.confirm(
       "ستُستبدل الترجمات الحالية لكل المناطق، بما فيها التعديلات اليدوية. هل تريد المتابعة؟",
     )
@@ -1126,29 +1229,9 @@ async function retranslateSelected(): Promise<void> {
   }
 
   await runTask(`ترجمة مناطق ${job.name}…`, async () => {
-    job.stage = "ترجمة المناطق الحالية…";
-    refreshProgress();
     try {
-      const result = await translatePage(
-        job.url,
-        job.analysis!.boxes,
-        toPipelineSettings(state.settings).translation,
-      );
-      job.analysis!.translations = job.analysis!.boxes.map(
-        (_, index) => result.translations[index] ?? "",
-      );
-      job.analysis!.sourceTexts = job.analysis!.boxes.map(
-        (_, index) => result.sourceTexts?.[index] ?? "",
-      );
-      job.dirty = true;
-      if (job.status === "done") job.status = "ready";
-      job.stage = `${job.analysis!.boxes.length} منطقة مترجمة`;
+      await translateJob(job);
       state.progress = 100;
-      state.status = `تمت ترجمة مناطق ${job.name}.`;
-      scheduleProjectSave();
-    } catch (error) {
-      job.stage = "فشلت ترجمة المناطق";
-      throw error;
     } finally {
       refreshAll();
     }
@@ -1785,19 +1868,204 @@ function normalizedImageType(file: File): string | null {
   return IMAGE_EXTENSION_TYPES[extension] ?? null;
 }
 
-async function addFiles(files: FileList | File[]): Promise<void> {
-  const list: File[] = [];
-  for (const file of Array.from(files)) {
-    const type = normalizedImageType(file);
-    if (!type) continue;
-    list.push(file.type === type ? file : new File([file], file.name, { type }));
+function filePath(file: File): string {
+  const imported = importedPaths.get(file);
+  if (imported) return imported;
+  const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+  return relative?.trim() || file.name;
+}
+
+function folderNameFromFiles(files: File[]): string {
+  for (const file of files) {
+    const parts = filePath(file).split("/").filter(Boolean);
+    if (parts.length > 1) return parts[0];
   }
-  if (list.length === 0) {
-    toast("اختر صور PNG أو JPG أو WebP أو GIF أو AVIF.", "err");
+  return "";
+}
+
+function fileKey(file: File): string {
+  return `${filePath(file)}\u0000${file.size}\u0000${file.lastModified}`;
+}
+
+const MAX_DROP_DEPTH = 8;
+const MAX_DROP_FILES = 1000;
+
+function readDirectoryEntries(reader: FileSystemDirectoryReader): Promise<FileSystemEntry[]> {
+  return new Promise((resolve, reject) => {
+    const entries: FileSystemEntry[] = [];
+    const readNext = (): void => {
+      reader.readEntries((batch) => {
+        if (batch.length === 0) {
+          resolve(entries);
+          return;
+        }
+        entries.push(...batch);
+        readNext();
+      }, reject);
+    };
+    readNext();
+  });
+}
+
+async function collectEntryFiles(
+  entry: FileSystemEntry,
+  files: File[],
+  path = "",
+  depth = 0,
+): Promise<void> {
+  if (files.length >= MAX_DROP_FILES) return;
+  const currentPath = path ? `${path}/${entry.name}` : entry.name;
+
+  if (entry.isFile) {
+    try {
+      const file = await new Promise<File>((resolve, reject) => {
+        (entry as FileSystemFileEntry).file(resolve, reject);
+      });
+      importedPaths.set(file, currentPath);
+      files.push(file);
+    } catch {
+      // Ignore files the browser cannot read and continue with the rest.
+    }
     return;
   }
 
-  for (const file of list) {
+  if (!entry.isDirectory || depth >= MAX_DROP_DEPTH) return;
+  try {
+    const children = await readDirectoryEntries(
+      (entry as FileSystemDirectoryEntry).createReader(),
+    );
+    for (const child of children) {
+      await collectEntryFiles(child, files, currentPath, depth + 1);
+      if (files.length >= MAX_DROP_FILES) break;
+    }
+  } catch {
+    // Ignore unreadable directories and continue with the rest of the drop.
+  }
+}
+
+interface DroppedFiles {
+  files: File[];
+  folders: string[];
+}
+
+async function filesFromDataTransfer(transfer: DataTransfer): Promise<DroppedFiles> {
+  const fallbackFiles = Array.from(transfer.files);
+  const entries = Array.from(transfer.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.webkitGetAsEntry?.() ?? null)
+    .filter((entry): entry is FileSystemEntry => entry !== null);
+
+  if (entries.length === 0) return { files: fallbackFiles, folders: [] };
+
+  const files: File[] = [];
+  const folders: string[] = [];
+  for (const entry of entries) {
+    if (entry.isDirectory) folders.push(entry.name);
+    await collectEntryFiles(entry, files, "", 0);
+  }
+
+  if (files.length === 0) return { files: fallbackFiles, folders: [] };
+  return { files, folders };
+}
+
+interface AddFilesOptions {
+  fromFolder?: boolean;
+  folderName?: string;
+}
+
+async function importFiles(
+  files: FileList | File[],
+  options: AddFilesOptions = {},
+): Promise<void> {
+  if (state.busy) {
+    toast("انتظر انتهاء العملية الحالية قبل إضافة صفحات.", "err");
+    return;
+  }
+  await runTask("إضافة الصفحات…", () => addFiles(files, options));
+}
+
+async function addFiles(files: FileList | File[], options: AddFilesOptions = {}): Promise<void> {
+  const incoming = Array.from(files);
+  for (const file of incoming) {
+    const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+    if (relative?.trim() && !importedPaths.has(file)) {
+      importedPaths.set(file, relative.trim());
+    }
+  }
+  const folderName =
+    options.folderName !== undefined
+      ? options.folderName
+      : options.fromFolder
+        ? folderNameFromFiles(incoming)
+        : "";
+  const existing = new Set(state.pages.map((job) => fileKey(job.file)));
+  const candidates: File[] = [];
+  let skipped = 0;
+  let unsupported = 0;
+
+  for (const file of incoming) {
+    const type = normalizedImageType(file);
+    if (!type) {
+      unsupported++;
+      continue;
+    }
+    const key = fileKey(file);
+    if (existing.has(key)) {
+      skipped++;
+      continue;
+    }
+    existing.add(key);
+    candidates.push(file);
+  }
+
+  if (candidates.length === 0) {
+    if (skipped > 0) {
+      state.status = "كل الصور المختارة مضافة بالفعل.";
+      toast("كل الصور المختارة مضافة بالفعل.", "info");
+    } else {
+      state.status = "لم يتم العثور على صور مدعومة.";
+      toast("اختر صور PNG أو JPG أو WebP أو GIF أو AVIF.", "err");
+    }
+    renderStatus();
+    return;
+  }
+
+  candidates.sort((a, b) =>
+    filePath(a).localeCompare(filePath(b), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    }),
+  );
+
+  const remaining = MAX_PROJECT_PAGES - state.pages.length;
+  if (remaining <= 0) {
+    state.status = `وصلت إلى الحد الأقصى (${MAX_PROJECT_PAGES} صفحة).`;
+    toast(`لا يمكن إضافة أكثر من ${MAX_PROJECT_PAGES} صفحة في مشروع واحد.`, "err", 7000);
+    renderStatus();
+    return;
+  }
+
+  const limited = candidates.length > remaining;
+  const accepted = limited ? candidates.slice(0, remaining) : candidates;
+  const list = accepted.map((file) => {
+    const type = normalizedImageType(file);
+    if (!type || file.type === type) return file;
+    const converted = new File([file], file.name, {
+      type,
+      lastModified: file.lastModified,
+    });
+    const path = importedPaths.get(file);
+    if (path) importedPaths.set(converted, path);
+    return converted;
+  });
+
+  const folderText = folderName ? ` من مجلد «${folderName}»` : "";
+  for (let index = 0; index < list.length; index++) {
+    const file = list[index];
+    state.status = `قراءة الصفحة ${index + 1} من ${list.length}: ${file.name}`;
+    state.progress = Math.round((index / list.length) * 100);
+    renderStatus();
+
     const url = URL.createObjectURL(file);
     const meta = await loadImageMeta(url).catch(() => ({ width: 0, height: 0 }));
     const job: PageJob = {
@@ -1818,10 +2086,32 @@ async function addFiles(files: FileList | File[]): Promise<void> {
     if (!state.selectedId) state.selectedId = job.id;
   }
 
-  state.status = `تمت إضافة ${list.length} صفحة.`;
+  const notes: string[] = [];
+  if (skipped > 0) notes.push(`تجاهل ${skipped} مكررة`);
+  if (unsupported > 0) notes.push(`تجاهل ${unsupported} غير مدعومة`);
+  if (limited) notes.push(`توقف عند الحد الأقصى ${MAX_PROJECT_PAGES}`);
+  const ignoredText = notes.length > 0 ? ` · ${notes.join(" · ")}` : "";
+  state.status = `تمت إضافة ${pageCountText(list.length, true)}${folderText}${ignoredText}.`;
+  state.progress = 100;
   refreshAll();
   scheduleProjectSave();
-  toast(`تمت إضافة ${list.length} صفحة.`, "ok");
+  toast(`تمت إضافة ${pageCountText(list.length, true)}${folderText}${ignoredText}.`, "ok", 5500);
+}
+
+async function importDroppedFiles(transfer: DataTransfer): Promise<void> {
+  try {
+    const dropped = await filesFromDataTransfer(transfer);
+    if (dropped.files.length === 0) {
+      toast("لم يتم العثور على صور مدعومة في العناصر المسحوبة.", "err");
+      return;
+    }
+    await importFiles(dropped.files, {
+      fromFolder: dropped.folders.length > 0,
+      folderName: dropped.folders.length === 1 ? dropped.folders[0] : "",
+    });
+  } catch (error) {
+    toast(`تعذّر قراءة العناصر المسحوبة: ${errorMessage(error)}`, "err", 8000);
+  }
 }
 
 function selectJob(id: string): void {
@@ -1906,18 +2196,45 @@ async function analyzeAll(): Promise<void> {
     toast("أضف صفحات أولًا.", "err");
     return;
   }
+  const settingsError = validateSettings(state.settings);
+  if (settingsError) {
+    toast(settingsError, "err", 7000);
+    return;
+  }
+
   await runTask("تحليل كل الصفحات…", async () => {
-    for (let index = 0; index < state.pages.length; index++) {
+    const total = state.pages.length;
+    const failures: Array<{ name: string; message: string }> = [];
+    let completed = 0;
+
+    for (let index = 0; index < total; index++) {
       const job = state.pages[index];
-      state.status = `تحليل الصفحة ${index + 1} من ${state.pages.length}: ${job.name}`;
+      state.status = `تحليل الصفحة ${index + 1} من ${total}: ${job.name}`;
       refreshProgress();
       try {
         await doAnalyze(job);
+        completed++;
       } catch (err) {
-        toast(`${job.name}: ${errorMessage(err)}`, "err", 7000);
+        failures.push({ name: job.name, message: errorMessage(err) });
       }
     }
-    state.status = "انتهى تحليل الصفحات.";
+
+    const analyzedText =
+      completed === total
+        ? `كل الصفحات (${total})`
+        : `${completed} من ${pageCountText(total, true)}`;
+    state.status =
+      failures.length === 0
+        ? `تم تحليل ${analyzedText}.`
+        : `تم تحليل ${analyzedText} · تعذّر تحليل ${pageCountText(failures.length, true)}.`;
+
+    if (failures.length > 0) {
+      const detail =
+        failures.length === 1
+          ? `${failures[0].name}: ${failures[0].message}`
+          : `تعذّر تحليل ${pageCountText(failures.length, true)}. راجع حالة الصفحات للتفاصيل.`;
+      toast(detail, "err", 9000);
+    }
   });
 }
 
@@ -1926,18 +2243,95 @@ async function processAll(): Promise<void> {
     toast("أضف صفحات أولًا.", "err");
     return;
   }
-  await runTask("معالجة كل الصفحات…", async () => {
-    for (let index = 0; index < state.pages.length; index++) {
-      const job = state.pages[index];
-      state.status = `معالجة الصفحة ${index + 1} من ${state.pages.length}: ${job.name}`;
-      refreshProgress();
-      try {
-        await ensureRender(job);
-      } catch (err) {
-        toast(`${job.name}: ${errorMessage(err)}`, "err", 7000);
-      }
+
+  const manual = state.settings.engine === "manual";
+  if (!manual) {
+    const settingsError = validateSettings(state.settings);
+    if (settingsError) {
+      toast(settingsError, "err", 7000);
+      return;
     }
-    state.status = "انتهت معالجة الصفحات.";
+  }
+
+  await runTask(manual ? "تركيب كل الصفحات…" : "ترجمة كل الصفحات…", async () => {
+    const total = state.pages.length;
+    const failures: Array<{ name: string; message: string }> = [];
+    let completed = 0;
+    let skipped = 0;
+    state.batchTotal = total;
+
+    try {
+      for (let index = 0; index < total; index++) {
+        const job = state.pages[index];
+        state.batchIndex = index;
+        state.batchPhase = "analyze";
+        state.status = `${manual ? "تركيب" : "ترجمة"} الصفحة ${index + 1} من ${total}: ${job.name}`;
+        refreshProgress();
+
+        try {
+          await ensureAnalysis(job);
+          if (
+            !manual &&
+            job.analysis &&
+            job.analysis.boxes.length > 0 &&
+            !pageHasTranslations(job)
+          ) {
+            await translateJob(job);
+          }
+          if (
+            manual &&
+            job.analysis &&
+            job.analysis.boxes.length > 0 &&
+            !pageHasTranslations(job)
+          ) {
+            skipped++;
+            state.batchPhase = "render";
+            setProgressPercent(100);
+            continue;
+          }
+
+          await ensureRender(job);
+          state.batchPhase = "render";
+          completed++;
+          setProgressPercent(100);
+        } catch (err) {
+          failures.push({ name: job.name, message: errorMessage(err) });
+          state.batchPhase = "render";
+          setProgressPercent(100);
+        }
+      }
+    } finally {
+      state.batchTotal = 0;
+      state.batchIndex = 0;
+      state.batchPhase = "analyze";
+    }
+
+    const action = manual ? "معالجة" : "ترجمة";
+    const completedText =
+      completed === total
+        ? `كل الصفحات (${total})`
+        : `${completed} من ${pageCountText(total, true)}`;
+    const parts = [`تمت ${action} ${completedText}`];
+    if (skipped > 0) parts.push(`تخطي ${pageCountText(skipped, true)} بلا ترجمة`);
+    if (failures.length > 0) {
+      parts.push(`تعذّرت معالجة ${pageCountText(failures.length, true)}`);
+    }
+    state.status = `${parts.join(" · ")}.`;
+
+    if (failures.length > 0) {
+      const detail =
+        failures.length === 1
+          ? `${failures[0].name}: ${failures[0].message}`
+          : `تعذّرت معالجة ${pageCountText(failures.length, true)}: ${failures
+              .slice(0, 3)
+              .map((failure) => failure.name)
+              .join("، ")}${failures.length > 3 ? "…" : ""}. راجع حالة الصفحات للتفاصيل.`;
+      toast(detail, "err", 10000);
+    } else if (completed > 0) {
+      toast(`تمت ${action} ${pageCountText(completed, true)}.`, "ok", 6000);
+    } else if (skipped > 0) {
+      toast("لم يتم تركيب أي صفحة. أضف ترجمات للصفحات أولًا.", "err", 8000);
+    }
   });
 }
 
@@ -1949,6 +2343,7 @@ async function downloadAll(): Promise<void> {
   await runTask("تجهيز ملف ZIP…", async () => {
     const zip = new JSZip();
     const used = new Set<string>();
+    const failures: Array<{ name: string; message: string }> = [];
     let added = 0;
 
     for (let index = 0; index < state.pages.length; index++) {
@@ -1957,7 +2352,10 @@ async function downloadAll(): Promise<void> {
       refreshProgress();
       try {
         await ensureRender(job);
-        if (!job.render) continue;
+        if (!job.render) {
+          failures.push({ name: job.name, message: "لم يتم إنشاء PSD." });
+          continue;
+        }
         let name = `${baseName(job.name)}.psd`;
         let suffix = 2;
         while (used.has(name)) name = `${baseName(job.name)}-${suffix++}.psd`;
@@ -1965,17 +2363,37 @@ async function downloadAll(): Promise<void> {
         zip.file(name, job.render.psd);
         added++;
       } catch (err) {
-        toast(`${job.name}: ${errorMessage(err)}`, "err", 7000);
+        failures.push({ name: job.name, message: errorMessage(err) });
       }
     }
 
-    if (added === 0) throw new Error("لم يتم إنشاء أي PSD.");
+    if (added === 0) {
+      throw new Error(
+        failures.length > 0
+          ? `لم يتم إنشاء أي PSD. تعذّر تجهيز ${failures.length} صفحة.`
+          : "لم يتم إنشاء أي PSD.",
+      );
+    }
+
     state.status = "ضغط الملفات…";
     refreshProgress();
     const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
     downloadBlob(blob, "manga-psd-pages.zip");
-    state.status = `تم تنزيل ${added} ملف PSD داخل ZIP.`;
+    state.status = `تم تنزيل ${added} ملف PSD داخل ZIP${
+      failures.length > 0 ? ` · تعذّر ${failures.length}` : ""
+    }.`;
     toast(`تم تنزيل ${added} ملف PSD.`, "ok");
+
+    if (failures.length > 0) {
+      const detail =
+        failures.length === 1
+          ? `${failures[0].name}: ${failures[0].message}`
+          : `تعذّر تجهيز ${failures.length} صفحة: ${failures
+              .slice(0, 3)
+              .map((failure) => failure.name)
+              .join("، ")}${failures.length > 3 ? "…" : ""}.`;
+      toast(detail, "err", 10000);
+    }
   });
 }
 
@@ -2070,32 +2488,54 @@ async function addCustomFontFromFile(file: File): Promise<void> {
 
 function bindEvents(): void {
   const fileInput = document.getElementById("file-input") as HTMLInputElement | null;
+  const folderInput = document.getElementById("folder-input") as HTMLInputElement | null;
   const dropzone = document.getElementById("dropzone");
   const pick = document.getElementById("pick-files");
+  const pickFolder = document.getElementById("pick-folder");
   const addMore = document.getElementById("add-more");
+  const addFolder = document.getElementById("add-folder");
 
-  const openPicker = () => fileInput?.click();
+  const openPicker = () => {
+    if (!state.busy) fileInput?.click();
+  };
+  const openFolderPicker = () => {
+    if (!state.busy) folderInput?.click();
+  };
   pick?.addEventListener("click", (event) => {
     event.stopPropagation();
     openPicker();
   });
+  pickFolder?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openFolderPicker();
+  });
   addMore?.addEventListener("click", openPicker);
+  addFolder?.addEventListener("click", openFolderPicker);
   dropzone?.addEventListener("click", openPicker);
   dropzone?.addEventListener("keydown", (event) => {
+    if (event.target !== dropzone) return;
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault();
       openPicker();
     }
   });
 
-  fileInput?.addEventListener("change", async () => {
-    if (fileInput.files) await addFiles(fileInput.files);
+  fileInput?.addEventListener("change", () => {
+    const files = fileInput.files ? Array.from(fileInput.files) : [];
     fileInput.value = "";
+    if (files.length > 0) void importFiles(files);
+  });
+  folderInput?.addEventListener("change", () => {
+    const files = folderInput.files ? Array.from(folderInput.files) : [];
+    folderInput.value = "";
+    if (files.length > 0) void importFiles(files, { fromFolder: true });
   });
 
   for (const type of ["dragenter", "dragover"]) {
     dropzone?.addEventListener(type, (event) => {
       event.preventDefault();
+      const dragEvent = event as DragEvent;
+      if (dragEvent.dataTransfer) dragEvent.dataTransfer.dropEffect = "copy";
       dropzone.classList.add("drag");
     });
   }
@@ -2105,9 +2545,11 @@ function bindEvents(): void {
       dropzone.classList.remove("drag");
     });
   }
-  dropzone?.addEventListener("drop", async (event) => {
-    const dragEvent = event as DragEvent;
-    if (dragEvent.dataTransfer?.files) await addFiles(dragEvent.dataTransfer.files);
+  dropzone?.addEventListener("drop", (event) => {
+    event.preventDefault();
+    dropzone.classList.remove("drag");
+    const transfer = (event as DragEvent).dataTransfer;
+    if (transfer) void importDroppedFiles(transfer);
   });
 
   document.getElementById("analyze-all")?.addEventListener("click", () => void analyzeAll());
