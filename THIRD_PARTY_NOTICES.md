@@ -53,6 +53,15 @@ MIT License. Copyright (c) 2016 Agamnentzar.
 
 Used to write Photoshop PSD files, including editable text layers.
 
+### fontkit 2.0.4
+
+MIT License. Copyright (c) Devon Govett and fontkit contributors.
+
+Used on demand to read the family and PostScript names from user-supplied
+TTF/OTF/WOFF/WOFF2 font files. Font files remain in the user's browser
+(IndexedDB) and are not uploaded or bundled. The license text is preserved in
+`licenses/fontkit-MIT.txt`.
+
 ### jszip 3.10.2
 
 Dual-licensed MIT / GPL-3.0-or-later. This project uses it under the **MIT**

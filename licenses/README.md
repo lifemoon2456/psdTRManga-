@@ -5,6 +5,8 @@
   including its model, font, and technique attributions.
 - `ComicTL-MIT.txt` — MIT notice for ComicTL, the upstream project from which
   Libre Manga Translator is derived.
+- `fontkit-MIT.txt` — MIT notice for fontkit, used on demand to read metadata
+  from user-supplied font files.
 - `Apache-2.0.txt` — Apache License 2.0 text (TypeScript; the PaddleOCR
   dictionary; also referenced by the Apache-2.0 model weights downloaded at
   runtime).

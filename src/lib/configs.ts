@@ -52,13 +52,17 @@ export interface FontPreset {
   postscriptName: string;
   /** Bundled file path, when present. */
   file?: string;
+  /** True for a font uploaded by the user and stored in IndexedDB. */
+  custom?: boolean;
+  /** Original filename for a user-supplied font. */
+  fileName?: string;
   rtl?: boolean;
 }
 
 /**
  * Fonts must be installed on the machine that opens the PSD. The app bundles
- * the files (where available) and exposes a download link; PSD itself only
- * stores the PostScript name.
+ * the built-in files, lets users add their own locally, and exposes a download
+ * link; PSD itself only stores the PostScript name.
  */
 export const FONT_PRESETS: FontPreset[] = [
   {

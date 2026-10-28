@@ -1,4 +1,5 @@
 import { DefaultConfig, FONT_PRESETS, type FontPreset } from "../lib/configs";
+import { allFontPresets } from "../lib/custom-fonts";
 import type { PageAnalysis, PageRender, PipelineSettings } from "../lib/pipeline";
 import type { TranslationEngine } from "../lib/translation";
 
@@ -80,7 +81,7 @@ export function saveSettings(settings: AppSettings): void {
 }
 
 export function selectedFont(settings: AppSettings): FontPreset {
-  return FONT_PRESETS.find((font) => font.id === settings.fontId) ?? FONT_PRESETS[0];
+  return allFontPresets().find((font) => font.id === settings.fontId) ?? FONT_PRESETS[0];
 }
 
 export function toPipelineSettings(settings: AppSettings): PipelineSettings {

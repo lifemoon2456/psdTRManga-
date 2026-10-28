@@ -230,6 +230,80 @@ table.translations textarea:focus { outline: none; border-color: var(--accent); 
 .field .row { display: flex; gap: 8px; align-items: center; }
 .field .row input[type="checkbox"] { width: auto; }
 .hint { color: var(--muted-2); font-size: 11px; line-height: 1.6; }
+.font-preview {
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: rgba(15, 19, 28, 0.7);
+  font-size: 20px;
+  line-height: 1.6;
+  text-align: center;
+}
+.font-manager {
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  padding: 12px;
+  background: rgba(15, 19, 28, 0.45);
+  margin-bottom: 12px;
+}
+.font-manager-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.font-manager-head strong { font-size: 12px; color: var(--text); }
+.custom-font-list { display: flex; flex-direction: column; gap: 8px; }
+.custom-font-row {
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  padding: 9px 10px;
+  background: rgba(26, 31, 45, 0.55);
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+}
+.custom-font-row.selected {
+  border-color: rgba(139, 124, 255, 0.5);
+  background: rgba(139, 124, 255, 0.08);
+}
+.custom-font-info { min-width: 0; flex: 1; }
+.custom-font-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.custom-font-sample {
+  font-size: 18px;
+  line-height: 1.5;
+  margin: 2px 0 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.custom-font-actions {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  flex: none;
+}
+.custom-font-row .hint code { font-size: 10px; overflow-wrap: anywhere; }
+.link-button {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: #b9b0ff;
+  text-decoration: underline;
+  font: inherit;
+  cursor: pointer;
+}
+.link-button:hover { color: #ddd8ff; }
+.empty.small { padding: 12px; font-size: 12px; }
 .divider { height: 1px; background: var(--border-soft); margin: 14px 0; }
 .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; padding: 3px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
 .badge.ok { color: #bbf7d0; border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }

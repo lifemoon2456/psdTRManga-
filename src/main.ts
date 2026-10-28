@@ -1,6 +1,15 @@
 import "./style.css";
 import JSZip from "jszip";
 import { DefaultConfig, FONT_PRESETS } from "./lib/configs";
+import {
+  allFontPresets,
+  customFontsPersistenceError,
+  getCustomFontDownload,
+  importCustomFont,
+  listCustomFonts,
+  loadCustomFonts,
+  removeCustomFont,
+} from "./lib/custom-fonts";
 import { analyzePage, renderPage, type PipelineStage } from "./lib/pipeline";
 import { downloadBytes } from "./lib/psd";
 import {
@@ -216,12 +225,58 @@ function renderSettings(): void {
     )
     .join("");
 
-  const fontOptions = FONT_PRESETS.map(
-    (item) =>
-      `<option value="${escapeHtml(item.id)}" ${
-        s.fontId === item.id ? "selected" : ""
-      }>${escapeHtml(item.label)}</option>`,
-  ).join("");
+  const customFonts = listCustomFonts();
+  const fontOptions = allFontPresets()
+    .map(
+      (item) =>
+        `<option value="${escapeHtml(item.id)}" ${
+          s.fontId === item.id ? "selected" : ""
+        }>${escapeHtml(item.label)}</option>`,
+    )
+    .join("");
+
+  const customFontRows =
+    customFonts.length > 0
+      ? customFonts
+          .map((item) => {
+            const isSelected = s.fontId === item.id;
+            return `
+              <div class="custom-font-row${isSelected ? " selected" : ""}">
+                <div class="custom-font-info">
+                  <div class="custom-font-title">
+                    <strong>${escapeHtml(item.label)}</strong>
+                    ${isSelected ? `<span class="badge ok">محدد</span>` : ""}
+                  </div>
+                  <div class="custom-font-sample" dir="rtl" style="font-family: ${escapeHtml(item.cssStack)}">
+                    أبجد هوز حطي
+                  </div>
+                  <div class="hint">
+                    ${escapeHtml(item.fileName)} · ${formatBytes(item.size)} ·
+                    PostScript: <code>${escapeHtml(item.postscriptName)}</code>
+                  </div>
+                </div>
+                <div class="custom-font-actions">
+                  ${
+                    isSelected
+                      ? ""
+                      : `<button type="button" class="small" data-font-action="select" data-font-id="${escapeHtml(item.id)}">استخدام</button>`
+                  }
+                  <button type="button" class="small" data-font-action="download" data-font-id="${escapeHtml(item.id)}">تنزيل</button>
+                  <button type="button" class="small danger" data-font-action="delete" data-font-id="${escapeHtml(item.id)}">حذف</button>
+                </div>
+              </div>
+            `;
+          })
+          .join("")
+      : `<div class="empty small">لم تُضف خطوطًا مخصصة بعد.</div>`;
+
+  const fontHint = font.custom
+    ? `خط مخصص محفوظ في هذا المتصفح. <button type="button" class="link-button" data-font-action="download" data-font-id="${escapeHtml(font.id)}">تنزيل ملف الخط</button> ثم ثبّته على جهازك قبل فتح PSD.`
+    : font.file
+      ? `<a href="${escapeHtml(font.file)}" download>تنزيل ملف الخط</a> ثم ثبّته على جهازك قبل فتح PSD.`
+      : "ثبّت الخط على جهازك قبل فتح PSD.";
+
+  const persistenceError = customFontsPersistenceError();
 
   const geminiFields = `
     <div class="field">
@@ -326,8 +381,32 @@ function renderSettings(): void {
     <div class="field">
       <label for="font">خط النص العربي</label>
       <select id="font" data-setting="fontId">${fontOptions}</select>
-      <div class="hint">
-        ${font.file ? `<a href="${escapeHtml(font.file)}" download>تنزيل ملف الخط</a> ثم ثبّته على جهازك قبل فتح PSD.` : "ثبّت الخط على جهازك قبل فتح PSD."}
+      <div class="font-preview" dir="rtl" style="font-family: ${escapeHtml(font.cssStack)}">
+        أبجد هوز — نص عربي
+      </div>
+      <div class="hint">${fontHint}</div>
+    </div>
+
+    <div class="font-manager">
+      <div class="font-manager-head">
+        <div>
+          <strong>خطوط مخصصة</strong>
+          <div class="hint">أضف خطًا من جهازك (TTF / OTF / WOFF / WOFF2).</div>
+        </div>
+        <button type="button" class="small" id="custom-font-add">إضافة خط</button>
+      </div>
+      <input
+        id="custom-font-input"
+        type="file"
+        accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2"
+        hidden
+      />
+      <div id="custom-font-list" class="custom-font-list">${customFontRows}</div>
+      <div id="custom-font-status" class="hint" role="status"></div>
+      ${persistenceError ? `<div class="notice" style="margin-top:8px">${escapeHtml(persistenceError)}</div>` : ""}
+      <div class="hint" style="margin-top:8px">
+        تُحفظ الخطوط داخل IndexedDB في هذا المتصفح فقط، ولا تُرفع إلى أي خادم.
+        ملف PSD يخزّن اسم PostScript فقط؛ ثبّت الخط على جهاز فتح الملف لتعديل النص بنفس الشكل.
       </div>
     </div>
 
@@ -369,6 +448,7 @@ function renderHelp(): void {
     <ol style="margin:0; padding-inline-start:18px; color:var(--muted); font-size:12px; line-height:1.9">
       <li>أضف صفحات المانجا (يفضل دقة عالية).</li>
       <li>اختر لغة المصدر ومحرك الترجمة، ثم «تحليل الكل».</li>
+      <li>اختر خط النص من الإعدادات، أو أضف خطك الخاص (TTF / OTF / WOFF / WOFF2).</li>
       <li>راجع النص الأصلي والترجمة في الجدول وعدّل ما تريد.</li>
       <li>اضغط «تركيب وتحديث PSD» ثم نزّل الملف.</li>
     </ol>
@@ -377,7 +457,8 @@ function renderHelp(): void {
       ملف PSD يحتوي خلفية منظفة + طبقة نص قابلة للتعديل لكل فقاعة. عند تفعيل «طبقة المعاينة النقطية»
       تظهر نسخة عربية مطابقة للمتصفح فوق طبقات التعديل، وتبقى طبقات النص ظاهرة أسفلها ومزوّدة بصورة نقطية.
       أخفِ طبقة Preview من لوحة الطبقات لتعديل النص الحي.
-      ملفات الخطوط لا تُضمّن داخل PSD؛ ثبّت الخط المختار على جهاز فتح الملف.
+      ملفات الخطوط لا تُضمّن داخل PSD؛ ثبّت الخط المختار على جهاز فتح الملف. الخطوط المخصصة
+      محفوظة في هذا المتصفح ويمكنك تنزيل ملفها من قائمة «خطوط مخصصة» لتثبيته.
     </div>
     <div class="notice" style="margin-bottom:10px">
       إذا لم يظهر النص العربي بشكل صحيح داخل طبقة PSD، فعّل محرك النص الشرقي/World-Ready في Photoshop،
@@ -931,6 +1012,91 @@ async function downloadAll(): Promise<void> {
   });
 }
 
+function markRendersDirty(): void {
+  for (const job of state.pages) {
+    if (!job.render) continue;
+    job.dirty = true;
+    if (job.status === "done") job.status = "ready";
+  }
+}
+
+function selectCustomFont(id: string): void {
+  if (state.busy) {
+    toast("انتظر انتهاء العملية الحالية قبل تغيير الخط.", "err");
+    return;
+  }
+  const preset = allFontPresets().find((font) => font.id === id);
+  if (!preset) {
+    toast("لم يعد هذا الخط متاحًا. أعد إضافته من جديد.", "err");
+    return;
+  }
+  if (state.settings.fontId === id) return;
+  state.settings.fontId = id;
+  saveSettings(state.settings);
+  markRendersDirty();
+  renderSettings();
+  refreshAll();
+  toast(`تم اختيار الخط «${preset.label}». أعد تركيب الصفحات لتطبيقه على PSD.`, "ok", 6000);
+}
+
+function downloadCustomFont(id: string): void {
+  const file = getCustomFontDownload(id);
+  if (!file) {
+    toast("ملف الخط غير متاح في هذا المتصفح.", "err");
+    return;
+  }
+  downloadBlob(
+    new Blob([file.bytes as unknown as BlobPart], { type: file.mimeType }),
+    file.fileName,
+  );
+}
+
+async function deleteCustomFont(id: string): Promise<void> {
+  if (state.busy) {
+    toast("انتظر انتهاء العملية الحالية قبل حذف الخط.", "err");
+    return;
+  }
+  const info = listCustomFonts().find((font) => font.id === id);
+  if (!info) return;
+  if (!window.confirm(`حذف الخط «${info.label}» من هذا المتصفح؟`)) return;
+
+  const wasSelected = state.settings.fontId === id;
+  await removeCustomFont(id);
+  if (wasSelected) {
+    state.settings.fontId = FONT_PRESETS[0].id;
+    saveSettings(state.settings);
+    markRendersDirty();
+  }
+  renderSettings();
+  refreshAll();
+  toast(`تم حذف الخط «${info.label}».`, "ok");
+}
+
+async function addCustomFontFromFile(file: File): Promise<void> {
+  if (state.busy) {
+    toast("انتظر انتهاء العملية الحالية قبل إضافة خط.", "err");
+    return;
+  }
+
+  const status = document.getElementById("custom-font-status");
+  if (status) status.textContent = `جاري قراءة «${file.name}»…`;
+
+  try {
+    const info = await importCustomFont(file);
+    state.settings.fontId = info.id;
+    saveSettings(state.settings);
+    markRendersDirty();
+    renderSettings();
+    refreshAll();
+    toast(`تمت إضافة الخط «${info.label}» واختياره.`, "ok", 6500);
+  } catch (error) {
+    const message = errorMessage(error);
+    const currentStatus = document.getElementById("custom-font-status");
+    if (currentStatus) currentStatus.textContent = message;
+    toast(message, "err", 8000);
+  }
+}
+
 function bindEvents(): void {
   const fileInput = document.getElementById("file-input") as HTMLInputElement | null;
   const dropzone = document.getElementById("dropzone");
@@ -1050,6 +1216,25 @@ function bindEvents(): void {
   });
   document.getElementById("download-selected")?.addEventListener("click", () => void downloadSelected());
 
+  document.getElementById("settings-body")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (target.closest("#custom-font-add")) {
+      event.preventDefault();
+      (document.getElementById("custom-font-input") as HTMLInputElement | null)?.click();
+      return;
+    }
+
+    const actionButton = target.closest<HTMLElement>("[data-font-action]");
+    if (!actionButton) return;
+    event.preventDefault();
+    const action = actionButton.dataset.fontAction;
+    const id = actionButton.dataset.fontId;
+    if (!action || !id) return;
+    if (action === "select") selectCustomFont(id);
+    if (action === "download") downloadCustomFont(id);
+    if (action === "delete") void deleteCustomFont(id);
+  });
+
   document.getElementById("settings-body")?.addEventListener("input", (event) => {
     const target = event.target as HTMLInputElement | HTMLSelectElement;
     const key = target.dataset.setting as keyof AppSettings | undefined;
@@ -1058,12 +1243,28 @@ function bindEvents(): void {
   });
   document.getElementById("settings-body")?.addEventListener("change", (event) => {
     const target = event.target as HTMLInputElement | HTMLSelectElement;
+    if (target instanceof HTMLInputElement && target.id === "custom-font-input") {
+      const file = target.files?.[0];
+      target.value = "";
+      if (file) void addCustomFontFromFile(file);
+      return;
+    }
+
     const key = target.dataset.setting as keyof AppSettings | undefined;
     if (!key) return;
     updateSetting(key, target);
-    if (key === "engine") renderSettings();
+    if (key === "engine" || key === "fontId") renderSettings();
+    if (RENDER_SETTING_KEYS.has(key)) refreshAll();
   });
 }
+
+const RENDER_SETTING_KEYS = new Set<keyof AppSettings>([
+  "fontId",
+  "psdRtl",
+  "psdRasterPreview",
+  "psdCompress",
+  "inpaintMethod",
+]);
 
 function updateSetting(key: keyof AppSettings, target: HTMLInputElement | HTMLSelectElement): void {
   const value =
@@ -1073,11 +1274,19 @@ function updateSetting(key: keyof AppSettings, target: HTMLInputElement | HTMLSe
         ? Number(target.value)
         : target.value;
 
+  const previous = state.settings[key];
   (state.settings as unknown as Record<string, unknown>)[key] = value;
   saveSettings(state.settings);
+  if (previous !== value && RENDER_SETTING_KEYS.has(key)) markRendersDirty();
 }
 
-function main(): void {
+async function main(): Promise<void> {
+  await loadCustomFonts();
+  const currentFont = selectedFont(state.settings);
+  if (currentFont.id !== state.settings.fontId) {
+    state.settings.fontId = currentFont.id;
+    saveSettings(state.settings);
+  }
   renderShell();
   renderSettings();
   renderHelp();
@@ -1088,4 +1297,4 @@ function main(): void {
   bindEvents();
 }
 
-main();
+void main();
