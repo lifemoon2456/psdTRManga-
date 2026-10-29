@@ -1,13 +1,15 @@
 import { DefaultConfig, type FontPreset } from "./configs";
 import { detectTextBubble } from "./detections/main";
 import { getCachedSegmentation } from "./detections/segmentation";
+import { extractTextFromBoxes } from "./ocr";
 import { inpaintImageAuto, inpaintImageQuality } from "./inpaint/ladder";
 import { buildPsd } from "./psd";
 import { imageDataFromUrl, renderTranslations } from "./render";
-import { translatePage, type TranslationSettings } from "./translation";
+import { shouldUseLocalOcr, type TranslationSettings } from "./translation";
 
 export type PipelineStage =
   | "detect"
+  | "ocr"
   | "translate"
   | "inpaint"
   | "compose"
@@ -29,6 +31,11 @@ export interface PageAnalysis {
   boxes: Bbox[];
   translations: string[];
   sourceTexts: string[];
+  /** Box indexes where local OCR returned no text. */
+  ocrFailedBoxes?: number[];
+  ocrConfidences?: number[];
+  ocrEngine?: string;
+  ocrError?: string;
 }
 
 export interface PageRender {
@@ -55,13 +62,28 @@ export async function analyzePage(
     return { boxes: [], translations: [], sourceTexts: [] };
   }
 
-  onProgress?.("translate", `ترجمة ${boxes.length} منطقة…`);
-  const result = await translatePage(imageSrc, boxes, settings.translation);
+  if (!shouldUseLocalOcr(settings.translation)) {
+    return {
+      boxes,
+      translations: new Array(boxes.length).fill(""),
+      sourceTexts: new Array(boxes.length).fill(""),
+    };
+  }
+
+  onProgress?.("ocr", `استخراج النص محليًا من ${boxes.length} منطقة…`);
+  const ocr = await extractTextFromBoxes(imageSrc, boxes, {
+    sourceLang: settings.translation.sourceLang,
+    onProgress: (message) => onProgress?.("ocr", message),
+  });
 
   return {
     boxes,
-    translations: result.translations,
-    sourceTexts: result.sourceTexts ?? new Array(boxes.length).fill(""),
+    translations: new Array(boxes.length).fill(""),
+    sourceTexts: ocr.texts,
+    ocrFailedBoxes: ocr.failedBoxes,
+    ocrConfidences: ocr.confidences,
+    ocrEngine: ocr.engine,
+    ocrError: ocr.error,
   };
 }
 

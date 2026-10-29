@@ -29,11 +29,13 @@ upstream browser extension.
 
 ## Bundled assets
 
-### PaddleOCR PP-OCRv6 dictionary
+### PaddleOCR dictionaries
 
-`public/dicts/ppocrv6_dict.txt` is a character dictionary derived from
-PaddleOCR's PP-OCRv6 stock dictionary, with space and blank entries added for
-the browser pipeline.
+- `public/dicts/ppocrv6_dict.txt` is a character dictionary derived from
+  PaddleOCR's PP-OCRv6 stock dictionary, with space and blank entries added for
+  the browser pipeline.
+- `public/dicts/ppocrv5_en_dict.txt` is the English PP-OCRv5 character
+  dictionary used by the browser OCR decoder.
 
 - PaddleOCR: <https://github.com/PaddlePaddle/PaddleOCR>
 - Copyright (c) PaddlePaddle Authors
@@ -117,6 +119,8 @@ each model's license before redistributing weights or hosting them yourself.
 | Comic Text Detector | [`zyddnys/manga-image-translator` release](https://github.com/zyddnys/manga-image-translator/releases) | GPL-3.0 |
 | RT-DETR v4 (`detector-v4-s_int8.onnx`) | [`ogkalu/comic-text-and-bubble-detector`](https://huggingface.co/ogkalu/comic-text-and-bubble-detector) | Apache-2.0 |
 | LaMa manga dynamic | [`ogkalu/lama-manga-onnx-dynamic`](https://huggingface.co/ogkalu/lama-manga-onnx-dynamic) | Apache-2.0 |
+| PP-OCRv6 manga recognizer | [`fumetodev/PP-OCRv6_small_rec_manga_ONNX`](https://huggingface.co/fumetodev/PP-OCRv6_small_rec_manga_ONNX) | Apache-2.0 |
+| PP-OCRv5 English recognizer | [`monkt/paddleocr-onnx`](https://huggingface.co/monkt/paddleocr-onnx) | Apache-2.0 |
 
 The Comic Text Detector is fetched at runtime and is not linked into the app.
 If you redistribute a build together with model weights, comply with the

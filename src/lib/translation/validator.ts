@@ -132,3 +132,77 @@ export function validateTranslationResult(
 
   return { translations, sourceTexts, context };
 }
+
+export interface IdTranslationItem {
+  id: string;
+  translation: string;
+}
+
+export interface IdValidationResult {
+  translations: Map<string, string>;
+  missing: string[];
+  unexpected: string[];
+  duplicates: string[];
+  empty: string[];
+  receivedIds: string[];
+}
+
+/**
+ * Validates the ID-keyed text-only protocol. Array order is deliberately
+ * ignored. Missing, duplicate, unexpected and empty ids are reported instead
+ * of being silently padded, truncated or merged.
+ */
+export function validateIdTranslations(
+  raw: unknown,
+  expectedIds: string[],
+): IdValidationResult {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("API Schema Error: response must be a JSON object.");
+  }
+  const record = raw as Record<string, unknown>;
+  if (!Array.isArray(record.translations)) {
+    throw new Error("API Schema Error: 'translations' must be an array.");
+  }
+
+  const expected = new Set(expectedIds);
+  const translations = new Map<string, string>();
+  const unexpected: string[] = [];
+  const duplicates: string[] = [];
+  const empty: string[] = [];
+  const receivedIds: string[] = [];
+
+  for (const item of record.translations) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new Error("API Schema Error: each translation must be an object with id and translation.");
+    }
+    const entry = item as Record<string, unknown>;
+    const id = typeof entry.id === "string" ? entry.id.trim() : "";
+    const translation = typeof entry.translation === "string" ? entry.translation.trim() : "";
+    if (!id) {
+      throw new Error("API Schema Error: a translation item is missing its id.");
+    }
+    receivedIds.push(id);
+    if (!expected.has(id)) {
+      if (!unexpected.includes(id)) unexpected.push(id);
+      continue;
+    }
+    if (translations.has(id)) {
+      if (!duplicates.includes(id)) duplicates.push(id);
+      if (!translations.get(id)?.trim() && translation) translations.set(id, translation);
+      continue;
+    }
+    if (!translation) {
+      empty.push(id);
+      translations.set(id, "");
+      continue;
+    }
+    translations.set(id, translation);
+  }
+
+  const missing = expectedIds.filter((id) => {
+    const value = translations.get(id);
+    return !value || !value.trim();
+  });
+
+  return { translations, missing, unexpected, duplicates, empty, receivedIds };
+}

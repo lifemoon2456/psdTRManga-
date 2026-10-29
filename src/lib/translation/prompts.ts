@@ -49,3 +49,87 @@ JSON shape:
 export function buildCorrectionPrompt(boxCount: number, received: number): string {
   return `Your previous response contained ${received} translations, but exactly ${boxCount} are required. Return the complete corrected JSON with exactly ${boxCount} translations and ${boxCount} sourceTexts, one per numbered box, in order. Do not explain.`;
 }
+
+export interface TextBatchPromptOptions {
+  sourceLang: string;
+  targetLang: string;
+  glossary?: string;
+  seriesSummary?: string;
+  segments: Array<{ id: string; text: string }>;
+}
+
+export interface TextBatchPrompts {
+  systemPrompt: string;
+  userPrompt: string;
+}
+
+function sourceDescription(sourceLang: string): string {
+  return sourceLang === "Auto-Detect"
+    ? "the source language (Japanese or English; infer it from the text)"
+    : sourceLang;
+}
+
+/**
+ * Compact, reusable prompt for ID-keyed text-only translation. The JSON itself
+ * is in the user message so identical instructions can be cached by providers.
+ */
+export function buildTextBatchPrompts(options: TextBatchPromptOptions): TextBatchPrompts {
+  const { sourceLang, targetLang, glossary, seriesSummary, segments } = options;
+  const source = sourceDescription(sourceLang);
+  const glossaryText = glossary?.trim();
+  const summaryText = seriesSummary?.trim();
+
+  const systemPrompt = `You are a professional manga translator working from ${source} into ${targetLang}.
+Translate every input segment naturally, as dialogue lettered for a manga: preserve meaning, emotion, character voice, jokes, honorifics, and the flow between neighbouring segments.
+Keep character names and terminology consistent. If a sentence is split across segments, translate each part so the connected sentence still reads naturally.
+Never invent, delete, merge, split, reorder, or add segments. Empty input must stay empty.
+Return JSON only. Do not include commentary, markdown, source text, or explanations.
+
+The output must be exactly:
+{"translations":[{"id":"the exact input id","translation":"Arabic translation"}]}
+Every input id must appear exactly once. Do not translate the ids themselves.`;
+
+  const userPrompt = [
+    summaryText ? `Series/chapter context (reuse consistently):\n${summaryText}` : "",
+    glossaryText ? `Glossary (source = target; follow it exactly):\n${glossaryText}` : "",
+    `Target language: ${targetLang}.`,
+    "Segments (ordered in manga reading order):",
+    JSON.stringify({ segments }),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  return { systemPrompt, userPrompt };
+}
+
+export function buildMissingIdsPrompt(missingIds: string[], receivedIds: string[]): string {
+  return `Your previous response was incomplete or contained duplicate ids.
+Missing ids: ${JSON.stringify(missingIds)}
+Received ids: ${JSON.stringify(receivedIds)}
+Return only the missing ids now, each exactly once, in this JSON shape:
+{"translations":[{"id":"...","translation":"..."}]}
+Do not repeat ids that were already translated. Do not add explanations.`;
+}
+
+/** Gemini-compatible OpenAPI subset schema for the ID-keyed response. */
+export function buildTextBatchJsonSchema(): Record<string, unknown> {
+  return {
+    type: "OBJECT",
+    properties: {
+      translations: {
+        type: "ARRAY",
+        items: {
+          type: "OBJECT",
+          properties: {
+            id: { type: "STRING" },
+            translation: { type: "STRING" },
+          },
+          required: ["id", "translation"],
+          propertyOrdering: ["id", "translation"],
+        },
+      },
+    },
+    required: ["translations"],
+    propertyOrdering: ["translations"],
+  };
+}

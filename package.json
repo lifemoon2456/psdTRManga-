@@ -30,7 +30,8 @@
     "build": "tsc --noEmit && vite build",
     "postbuild": "node scripts/copy-legal.mjs",
     "preview": "vite preview",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "tsx --test tests/batching.test.ts tests/smart-batch.test.ts tests/request-manager.test.ts tests/ocr-layout.test.ts tests/detections-contract.test.ts"
   },
   "dependencies": {
     "ag-psd": "^33.0.0",
@@ -39,6 +40,8 @@
     "onnxruntime-web": "1.31.1"
   },
   "devDependencies": {
+    "fake-indexeddb": "^6.2.6",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.2",
     "vite": "^7.0.0"
   }

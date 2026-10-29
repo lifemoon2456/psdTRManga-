@@ -11,6 +11,7 @@ export interface OpenAIVisionOptions {
   temperature?: number;
   jsonMode?: boolean;
   seriesContext?: SeriesContext;
+  signal?: AbortSignal;
 }
 
 interface ChatCompletionResponse {
@@ -58,6 +59,7 @@ async function callOpenAI(
     method: "POST",
     headers,
     body: JSON.stringify(body),
+    signal: options.signal,
   });
 
   const text = await response.text();

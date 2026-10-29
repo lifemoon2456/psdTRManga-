@@ -32,7 +32,26 @@ import {
   type ProjectSnapshot,
 } from "./lib/project";
 import { downloadBytes } from "./lib/psd";
-import { translatePage } from "./lib/translation";
+import {
+  isTextOnlyTranslation,
+  isVisionTranslation,
+  translatePage,
+  type TranslationSettings,
+} from "./lib/translation";
+import {
+  bubbleId as buildBubbleId,
+  planTextBatches,
+  type TranslationBubbleInput,
+} from "./lib/translation/batching";
+import { clearTranslationCache, countTranslationCache } from "./lib/translation/cache";
+import {
+  isAbortError,
+  QuotaExhaustedError,
+  RequestAbortedError,
+  RequestManager,
+  type RequestManagerStats,
+} from "./lib/translation/request-manager";
+import { translateBubbles } from "./lib/translation/smart-batch";
 import {
   baseName,
   clamp,
@@ -55,6 +74,58 @@ import {
 } from "./ui/state";
 
 type PreviewTab = "original" | "cleaned" | "final";
+type ArchiveFormat = "psd" | "png" | "both";
+
+interface BatchStats {
+  pagesTotal: number;
+  pagesAnalyzed: number;
+  extractedBubbles: number;
+  totalBubbles: number;
+  translatedBubbles: number;
+  cacheHits: number;
+  ocrFailures: number;
+  visionFallbacks: number;
+  batchesTotal: number;
+  batchesDone: number;
+  remainingBatches: number;
+  requests: number;
+  promptTokens: number;
+  candidatesTokens: number;
+  totalTokens: number;
+  errors: number;
+  missingBubbles: number;
+}
+
+function prepareSinglePageRun(phase: "analyze" | "translate" | "render" = "analyze"): void {
+  state.batchStats = emptyBatchStats(1);
+  state.batchTotal = 1;
+  state.batchIndex = 0;
+  state.batchPhase = phase;
+  state.apiNote = "";
+  renderBatchMetrics();
+}
+
+function emptyBatchStats(pagesTotal = 0): BatchStats {
+  return {
+    pagesTotal,
+    pagesAnalyzed: 0,
+    extractedBubbles: 0,
+    totalBubbles: 0,
+    translatedBubbles: 0,
+    cacheHits: 0,
+    ocrFailures: 0,
+    visionFallbacks: 0,
+    batchesTotal: 0,
+    batchesDone: 0,
+    remainingBatches: 0,
+    requests: 0,
+    promptTokens: 0,
+    candidatesTokens: 0,
+    totalTokens: 0,
+    errors: 0,
+    missingBubbles: 0,
+  };
+}
 
 const state = {
   pages: [] as PageJob[],
@@ -72,7 +143,11 @@ const state = {
   restoringProject: false,
   batchIndex: 0,
   batchTotal: 0,
-  batchPhase: "analyze" as "analyze" | "render",
+  batchPhase: "analyze" as "analyze" | "translate" | "render",
+  batchAbort: null as AbortController | null,
+  batchStats: emptyBatchStats(),
+  apiStats: null as RequestManagerStats | null,
+  apiNote: "",
 };
 
 let nextId = 1;
@@ -105,8 +180,9 @@ interface BoxDragState {
 let boxDrag: BoxDragState | null = null;
 
 const STAGE_PROGRESS: Record<PipelineStage, number> = {
-  detect: 14,
-  translate: 44,
+  detect: 12,
+  ocr: 36,
+  translate: 50,
   inpaint: 70,
   compose: 86,
   psd: 95,
@@ -153,9 +229,19 @@ function renderShell(): void {
           </div>
         </div>
         <div class="top-actions">
-          <button id="analyze-all" class="ghost" title="تحليل وترجمة كل الصفحات دون تركيب PSD">تحليل الكل</button>
+          <button id="analyze-all" class="ghost" title="كشف المناطق واستخراج النص محليًا وترجمته دون تركيب PSD">تحليل الكل</button>
           <button id="process-all" class="primary" title="تحليل وترجمة وتركيب PSD لكل الصفحات">ترجمة الكل</button>
-          <button id="download-all" title="تنزيل كل الصفحات المعالجة كملف ZIP">تنزيل كل PSD</button>
+          <button id="stop-batch" class="danger" hidden title="إيقاف بعد الدفعة الحالية">إيقاف</button>
+          <select id="download-format" aria-label="صيغة حزمة التصدير" title="صيغة الملفات داخل ZIP">
+            <option value="psd">PSD قابل للتعديل</option>
+            <option value="png">PNG نهائي</option>
+            <option value="both">PSD وPNG</option>
+          </select>
+          <button
+            id="download-all"
+            class="primary"
+            title="تصدير كل الصفحات المعالجة داخل ملف ZIP واحد"
+          >تصدير جميع الصفحات (ZIP)</button>
         </div>
       </header>
 
@@ -211,6 +297,7 @@ function renderShell(): void {
                   <span id="progress-text">0%</span>
                 </div>
                 <div class="progress" style="margin-top: 7px"><i id="progress-bar"></i></div>
+                <div id="batch-metrics" class="batch-metrics" hidden></div>
               </div>
             </div>
           </section>
@@ -218,7 +305,12 @@ function renderShell(): void {
           <section class="panel">
             <div class="panel-head">
               <h2>الصفحات <span id="page-count" class="badge">0</span></h2>
-              <div style="display:flex; gap:6px; flex-wrap:wrap">
+              <div class="pages-head-actions">
+                <div class="pages-navigation" aria-label="التنقل بين الصفحات">
+                  <button class="small" id="pages-next-page" type="button" disabled>التالي</button>
+                  <span id="pages-page-position" class="preview-page-position" aria-live="polite">—</span>
+                  <button class="small" id="pages-previous-page" type="button" disabled>السابق</button>
+                </div>
                 <button class="small" id="add-folder">إضافة مجلد</button>
                 <button class="small" id="add-more">إضافة صور</button>
                 <button class="small danger" id="clear-all">مسح الكل</button>
@@ -233,6 +325,25 @@ function renderShell(): void {
             <div class="panel-head">
               <h2>المعاينة</h2>
               <div class="preview-head-actions">
+                <div class="preview-navigation" aria-label="التنقل بين الصفحات">
+                  <button
+                    class="small"
+                    id="preview-next-page"
+                    type="button"
+                    title="الصفحة التالية"
+                    aria-label="الصفحة التالية"
+                    disabled
+                  >التالي</button>
+                  <span id="preview-page-position" class="preview-page-position" aria-live="polite">—</span>
+                  <button
+                    class="small"
+                    id="preview-previous-page"
+                    type="button"
+                    title="الصفحة السابقة"
+                    aria-label="الصفحة السابقة"
+                    disabled
+                  >السابق</button>
+                </div>
                 <div class="preview-tabs" id="preview-tabs">
                   <button class="small active" data-tab="original">الأصلية</button>
                   <button class="small" data-tab="cleaned" disabled>المنظفة</button>
@@ -297,9 +408,9 @@ function renderSettings(): void {
   const font = selectedFont(s);
 
   const engineOptions = [
-    ["gemini", "Gemini Vision — جودة عالية"],
+    ["gemini", "Gemini — OCR محلي + ترجمة نصية (موصى به)"],
     ["openai", "OpenAI-compatible Vision — محلي أو سحابي"],
-    ["manual", "يدوي — كشف فقط ثم أكتب الترجمة"],
+    ["manual", "يدوي — كشف وOCR ثم أكتب الترجمة"],
   ]
     .map(
       ([value, label]) =>
@@ -382,19 +493,118 @@ function renderSettings(): void {
     <div class="field">
       <label for="gemini-key">مفتاح Gemini API</label>
       <input id="gemini-key" data-setting="geminiApiKey" type="password" autocomplete="off"
+        autocapitalize="none" autocorrect="off" spellcheck="false" dir="ltr"
         value="${escapeHtml(s.geminiApiKey)}" placeholder="AIza..." />
+      <div class="hint">يبقى في هذا المتصفح فقط ولا يُضمّن في ملف المشروع.</div>
     </div>
     <div class="field">
       <label for="gemini-model">موديل Gemini</label>
       <input id="gemini-model" data-setting="geminiModel" list="gemini-model-list"
-        value="${escapeHtml(s.geminiModel)}" placeholder="gemini-2.5-flash" />
+        value="${escapeHtml(s.geminiModel)}" placeholder="gemini-2.5-flash-lite" />
       <datalist id="gemini-model-list">
+        <option value="gemini-2.5-flash-lite"></option>
         <option value="gemini-2.5-flash"></option>
         <option value="gemini-2.5-pro"></option>
         <option value="gemini-2.0-flash"></option>
       </datalist>
-      <div class="hint">للدقة العالية جرّب gemini-2.5-pro. للسرعة والتكلفة الأقل استخدم flash.</div>
+      <div class="hint">الافتراضي flash-lite لأنه أرخص وأسرع لترجمة نصوص فقط. يمكنك تغييره في أي وقت.</div>
     </div>
+    <div class="field">
+      <label for="gemini-mode">طريقة Gemini</label>
+      <select id="gemini-mode" data-setting="geminiMode">
+        <option value="text" ${s.geminiMode === "text" ? "selected" : ""}>نص فقط — OCR محلي (موصى به)</option>
+        <option value="vision" ${s.geminiMode === "vision" ? "selected" : ""}>Vision — يرسل صورة الصفحة (اختياري)</option>
+      </select>
+      <div class="hint">في وضع النص لا تُرسل أي صورة أو Base64 إلى Gemini. Vision يبقى متاحًا كخيار صريح أو كبديل عند فشل OCR.</div>
+    </div>
+    <div class="field">
+      <label for="gemini-base">عنوان Gemini API (متقدم)</label>
+      <input id="gemini-base" data-setting="geminiBaseUrl" type="text"
+        value="${escapeHtml(s.geminiBaseUrl)}" placeholder="https://generativelanguage.googleapis.com/v1beta" />
+      <div class="hint">يمكن تغييره لخادم اختبار متوافق. لا تستخدم عنوانًا غير موثوق مع مفتاحك.</div>
+    </div>
+
+    <details class="settings-group advanced-settings">
+      <summary>خيارات الترجمة المتقدمة</summary>
+      <div class="settings-group-content">
+        <div class="settings-subtitle">Smart Batch وإدارة الطلبات</div>
+
+    <div class="field">
+      <label class="row">
+        <input data-setting="smartBatch" type="checkbox" ${s.smartBatch ? "checked" : ""} />
+        تجميع الصفحات في دفعات ذكية (Smart Batch)
+      </label>
+      <div class="hint">افتراضيًا 4 صفحات لكل دفعة. تُقسَّم الدفعة تلقائيًا إذا تجاوزت ميزانية التوكنات.</div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="batch-pages">صفحات/دفعة</label>
+        <input id="batch-pages" data-setting="batchPages" type="number" min="1" max="8" step="1" value="${s.batchPages}" />
+      </div>
+      <div class="field">
+        <label for="batch-tokens">ميزانية التوكنات</label>
+        <input id="batch-tokens" data-setting="batchTokenBudget" type="number" min="1000" max="1000000" step="500" value="${s.batchTokenBudget}" />
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="max-concurrent">طلبات متزامنة</label>
+        <input id="max-concurrent" data-setting="maxConcurrentRequests" type="number" min="1" max="4" step="1" value="${s.maxConcurrentRequests}" />
+      </div>
+      <div class="field">
+        <label for="max-retries">إعادة المحاولة</label>
+        <input id="max-retries" data-setting="maxRetries" type="number" min="0" max="10" step="1" value="${s.maxRetries}" />
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label for="rpm-limit">حد RPM (0 = بلا حد محلي)</label>
+        <input id="rpm-limit" data-setting="rpmLimit" type="number" min="0" step="1" value="${s.rpmLimit}" />
+      </div>
+      <div class="field">
+        <label for="tpm-limit">حد TPM (0 = بلا حد محلي)</label>
+        <input id="tpm-limit" data-setting="tpmLimit" type="number" min="0" step="100" value="${s.tpmLimit}" />
+      </div>
+    </div>
+    <div class="hint">لا توجد حدود مجانية مبرمجة داخل التطبيق. اتركها 0 وحددها فقط إذا كانت خطتك تتطلب ذلك.</div>
+
+    <div class="field">
+      <label class="row">
+        <input data-setting="useCountTokens" type="checkbox" ${s.useCountTokens ? "checked" : ""} />
+        استخدام countTokens قبل كل دفعة (طلب إضافي)
+      </label>
+    </div>
+    <div class="field">
+      <label class="row">
+        <input data-setting="cacheEnabled" type="checkbox" ${s.cacheEnabled ? "checked" : ""} />
+        حفظ الترجمة في ذاكرة IndexedDB وإعادة استخدامها
+      </label>
+      <div class="hint">المفتاح يعتمد على النص واللغة والموديل والإعدادات والسياق. تعديل فقاعة واحدة لا يلغي ترجمات الصفحة.</div>
+      <div class="cache-row">
+        <span id="translation-cache-count" class="hint">جارٍ حساب الذاكرة…</span>
+        <button type="button" class="small danger" id="clear-translation-cache">مسح الذاكرة</button>
+      </div>
+    </div>
+    <div class="field">
+      <label class="row">
+        <input data-setting="useVisionOnOcrFailure" type="checkbox" ${s.useVisionOnOcrFailure ? "checked" : ""} />
+        استخدام Vision تلقائيًا للفقرات التي فشل OCR في قراءتها
+      </label>
+      <div class="hint">متوقف افتراضيًا. عند تفعيله يُرسل فقط صندوق/صناديق فشل OCR إلى Gemini Vision.</div>
+    </div>
+    <div class="field">
+      <label for="series-summary">سياق السلسلة/الفصل (اختياري)</label>
+      <textarea id="series-summary" class="source-input" data-setting="seriesSummary"
+        placeholder="أسماء الشخصيات، العلاقات، نبرة العمل، ملخص الفصل…">${escapeHtml(s.seriesSummary)}</textarea>
+      <div class="hint">يُعاد استخدامه في كل دفعة لتحسين الاتساق وتقليل تكرار الشرح.</div>
+    </div>
+    <div class="field">
+      <label for="glossary">قاموس المصطلحات (اختياري)</label>
+      <textarea id="glossary" class="source-input" data-setting="glossary"
+        placeholder="اسم ياباني = الاسم العربي&#10;مصطلح = ترجمة ثابتة">${escapeHtml(s.glossary)}</textarea>
+    </div>
+      </div>
+    </details>
   `;
 
   const openaiFields = `
@@ -431,30 +641,32 @@ function renderSettings(): void {
         : `<div class="notice info">وضع يدوي: سيتم كشف مناطق النص فقط، ثم تكتب الترجمة العربية في الجدول وتضغط «تركيب وتحديث PSD».</div>`;
 
   body.innerHTML = `
-    <div class="field">
-      <label for="engine">محرك الترجمة</label>
-      <select id="engine" data-setting="engine">${engineOptions}</select>
-    </div>
-    ${engineSpecific}
+    <details class="settings-group" open>
+      <summary>الترجمة واللغة</summary>
+      <div class="settings-group-content">
+        <div class="field">
+          <label for="engine">محرك الترجمة</label>
+          <select id="engine" data-setting="engine">${engineOptions}</select>
+        </div>
+        ${engineSpecific}
+        <div class="field">
+          <label for="source-lang">لغة المصدر</label>
+          <select id="source-lang" data-setting="sourceLang">${sourceOptions}</select>
+          <div class="hint">الهدف ثابت: العربية.</div>
+        </div>
+        <div class="field">
+          <label for="temperature">إبداعية الترجمة (temperature)</label>
+          <input id="temperature" data-setting="temperature" type="number" min="0" max="2" step="0.05"
+            value="${s.temperature}" />
+          <div class="hint">0.2–0.4 مناسبة للمانجا. القيم الأعلى قد تتصرف بحرية أكبر.</div>
+        </div>
+      </div>
+    </details>
 
-    <div class="divider"></div>
-
-    <div class="field">
-      <label for="source-lang">لغة المصدر</label>
-      <select id="source-lang" data-setting="sourceLang">${sourceOptions}</select>
-      <div class="hint">الهدف ثابت: العربية.</div>
-    </div>
-
-    <div class="field">
-      <label for="temperature">إبداعية الترجمة (temperature)</label>
-      <input id="temperature" data-setting="temperature" type="number" min="0" max="2" step="0.05"
-        value="${s.temperature}" />
-      <div class="hint">0.2–0.4 مناسبة للمانجا. القيم الأعلى قد تتصرف بحرية أكبر.</div>
-    </div>
-
-    <div class="divider"></div>
-
-    <div class="field">
+    <details class="settings-group">
+      <summary>الكشف والتنظيف</summary>
+      <div class="settings-group-content">
+        <div class="field">
       <label for="detection-model">موديل كشف النص</label>
       <select id="detection-model" data-setting="detectionModel">${detectionOptions}</select>
       <div class="hint">Comic Text Detector أدق في النص الياباني والصناديق، وRT-DETR أخف.</div>
@@ -475,10 +687,13 @@ function renderSettings(): void {
       </select>
       <div class="hint">LaMa ينزّل موديلًا إضافيًا (~207 MB) في أول مرة، وهو الأنظف داخل الفقاعات الداكنة. المسار السريع للمعاينة فقط وقد يترك آثارًا.</div>
     </div>
+      </div>
+    </details>
 
-    <div class="divider"></div>
-
-    <div class="field">
+    <details class="settings-group">
+      <summary>النص والتصدير</summary>
+      <div class="settings-group-content">
+        <div class="field">
       <label for="font">خط النص العربي</label>
       <select id="font" data-setting="fontId">${fontOptions}</select>
       <div class="font-preview" dir="rtl" style="font-family: ${escapeHtml(font.cssStack)}">
@@ -538,7 +753,21 @@ function renderSettings(): void {
     <div class="notice">
       مفاتيح API تُحفظ في localStorage داخل هذا المتصفح فقط. لا تستخدم هذا البناء على استضافة عامة مع مفاتيحك.
     </div>
+      </div>
+    </details>
   `;
+  void refreshCacheStatus();
+}
+
+async function refreshCacheStatus(): Promise<void> {
+  const element = document.getElementById("translation-cache-count");
+  if (!element) return;
+  try {
+    const count = await countTranslationCache();
+    element.textContent = `${count} ترجمة محفوظة في هذا المتصفح`;
+  } catch {
+    element.textContent = "ذاكرة الترجمة غير متاحة في هذا المتصفح";
+  }
 }
 
 function renderHelp(): void {
@@ -589,51 +818,65 @@ function renderPages(): void {
   if (!grid) return;
 
   if (state.pages.length === 0) {
+    updatePagesNavigation();
     grid.innerHTML = `<div class="empty">لم تُضف صفحات بعد. اسحب صور المانجا إلى الأعلى.</div>`;
     updateControls();
     return;
   }
 
-  grid.innerHTML = state.pages
-    .map((job) => {
-      const active = job.id === state.selectedId ? " active" : "";
-      const dotClass =
-        job.status === "error"
-          ? "err"
-          : job.status === "analyzing" || job.status === "rendering"
-            ? "busy"
-            : job.status === "done"
-              ? "ok"
-              : "";
-      const detail = job.error || job.stage || STATUS_LABEL[job.status];
-      const busy = state.busy || job.status === "analyzing" || job.status === "rendering";
+  const job = selectedJob() ?? state.pages[0];
+  const dotClass =
+    job.status === "error"
+      ? "err"
+      : job.status === "analyzing" || job.status === "rendering"
+        ? "busy"
+        : job.status === "done"
+          ? "ok"
+          : "";
+  const detail = job.error || job.stage || STATUS_LABEL[job.status];
+  const busy = state.busy || job.status === "analyzing" || job.status === "rendering";
 
-      return `
-        <div class="page-card${active}" data-page-id="${escapeHtml(job.id)}">
-          <div class="page-thumb">
-            <img src="${escapeHtml(job.url)}" alt="${escapeHtml(job.name)}" loading="lazy" />
-          </div>
-          <div class="page-meta">
-            <div class="page-name" title="${escapeHtml(job.name)}">${escapeHtml(job.name)}</div>
-            <div class="page-status" title="${escapeHtml(detail)}">
-              <span class="dot ${dotClass}"></span>
-              <span>${escapeHtml(detail)}</span>
-            </div>
-            <div class="page-actions">
-              <button class="small" data-action="analyze" ${busy ? "disabled" : ""}>
-                ${job.analysis ? "إعادة تحليل" : "تحليل"}
-              </button>
-              <button class="small" data-action="render" ${busy ? "disabled" : ""}>تركيب</button>
-              <button class="small primary" data-action="download" ${busy ? "disabled" : ""}>PSD</button>
-              <button class="small danger" data-action="remove" ${state.busy ? "disabled" : ""}>حذف</button>
-            </div>
-          </div>
+  // Render only the current page card. This keeps large folders lightweight:
+  // the image thumbnails for the remaining pages are not inserted into the DOM.
+  grid.innerHTML = `
+    <div class="page-card active" data-page-id="${escapeHtml(job.id)}">
+      <div class="page-thumb">
+        <img src="${escapeHtml(job.url)}" alt="${escapeHtml(job.name)}" />
+      </div>
+      <div class="page-meta">
+        <div class="page-name" title="${escapeHtml(job.name)}">${escapeHtml(job.name)}</div>
+        <div class="page-status" title="${escapeHtml(detail)}">
+          <span class="dot ${dotClass}"></span>
+          <span>${escapeHtml(detail)}</span>
         </div>
-      `;
-    })
-    .join("");
+        <div class="page-actions">
+          <button class="small" data-action="analyze" ${busy ? "disabled" : ""}>
+            ${job.analysis ? "إعادة تحليل" : "تحليل"}
+          </button>
+          <button class="small" data-action="render" ${busy ? "disabled" : ""}>تركيب</button>
+          <button class="small primary" data-action="download" ${busy ? "disabled" : ""}>PSD</button>
+          <button class="small danger" data-action="remove" ${state.busy ? "disabled" : ""}>حذف</button>
+        </div>
+      </div>
+    </div>
+  `;
 
+  updatePagesNavigation();
   updateControls();
+}
+
+function updatePagesNavigation(): void {
+  const previous = document.getElementById("pages-previous-page") as HTMLButtonElement | null;
+  const next = document.getElementById("pages-next-page") as HTMLButtonElement | null;
+  const position = document.getElementById("pages-page-position");
+  const index = state.pages.findIndex((page) => page.id === state.selectedId);
+  const hasSelection = index >= 0;
+
+  if (position) {
+    position.textContent = hasSelection ? `${index + 1} / ${state.pages.length}` : "—";
+  }
+  if (previous) previous.disabled = !hasSelection || index === 0;
+  if (next) next.disabled = !hasSelection || index === state.pages.length - 1;
 }
 
 function renderPreview(): void {
@@ -643,6 +886,7 @@ function renderPreview(): void {
   if (!stage || !side) return;
 
   const job = selectedJob();
+  updatePreviewNavigation();
   if (!job) {
     state.boxEditMode = false;
     state.selectedBoxIndex = null;
@@ -772,6 +1016,20 @@ function renderPreview(): void {
     <button data-preview-action="render" ${state.busy ? "disabled" : ""}>إعادة التركيب</button>
   `;
   updateBoxEditorSelectionUi();
+}
+
+function updatePreviewNavigation(): void {
+  const previous = document.getElementById("preview-previous-page") as HTMLButtonElement | null;
+  const next = document.getElementById("preview-next-page") as HTMLButtonElement | null;
+  const position = document.getElementById("preview-page-position");
+  const index = state.pages.findIndex((page) => page.id === state.selectedId);
+  const hasSelection = index >= 0;
+
+  if (position) {
+    position.textContent = hasSelection ? `${index + 1} / ${state.pages.length}` : "—";
+  }
+  if (previous) previous.disabled = !hasSelection || index === 0;
+  if (next) next.disabled = !hasSelection || index === state.pages.length - 1;
 }
 
 function boxPositionStyle(box: Bbox, width: number, height: number): string {
@@ -934,6 +1192,7 @@ function renderStatus(): void {
   if (progressText) progressText.textContent = `${percent}%`;
   if (bar) bar.style.width = `${percent}%`;
   updateControls();
+  renderBatchMetrics();
 }
 
 function formatSavedTime(timestamp: number): string {
@@ -975,6 +1234,11 @@ function updateControls(): void {
   setDisabled("analyze-all", state.busy || !hasPages);
   setDisabled("process-all", state.busy || !hasPages);
   setDisabled("download-all", state.busy || !hasPages);
+  const stop = document.getElementById("stop-batch") as HTMLButtonElement | null;
+  if (stop) {
+    stop.hidden = !state.batchAbort;
+    stop.disabled = !state.batchAbort;
+  }
   setDisabled("clear-all", state.busy || !hasPages);
   setDisabled("pick-files", state.busy);
   setDisabled("pick-folder", state.busy);
@@ -1024,8 +1288,9 @@ function updateControls(): void {
 function batchProgress(localPercent: number): number {
   if (state.batchTotal <= 0) return localPercent;
   const clamped = clamp(localPercent, 0, 100);
-  const phaseStart = state.batchPhase === "render" ? 45 : 0;
-  const phaseSpan = state.batchPhase === "render" ? 55 : 45;
+  const phaseStart =
+    state.batchPhase === "analyze" ? 0 : state.batchPhase === "translate" ? 30 : 70;
+  const phaseSpan = state.batchPhase === "analyze" ? 30 : state.batchPhase === "translate" ? 40 : 30;
   const pageFraction = (phaseStart + (clamped / 100) * phaseSpan) / 100;
   return ((state.batchIndex + pageFraction) / state.batchTotal) * 100;
 }
@@ -1054,11 +1319,96 @@ function refreshProgress(): void {
   renderStatus();
 }
 
+function createRequestManager(): RequestManager {
+  return new RequestManager({
+    config: {
+      maxConcurrent: state.settings.maxConcurrentRequests,
+      rpm: state.settings.rpmLimit,
+      tpm: state.settings.tpmLimit,
+      maxRetries: state.settings.maxRetries,
+    },
+  });
+}
+
+function trackManager(manager: RequestManager): () => void {
+  return manager.subscribe((stats) => {
+    state.apiStats = stats;
+    state.batchStats.requests = stats.requests;
+    state.batchStats.promptTokens = stats.promptTokens;
+    state.batchStats.candidatesTokens = stats.candidatesTokens;
+    state.batchStats.totalTokens = stats.totalTokens;
+    if (stats.quotaPausedUntil) {
+      state.apiNote = stats.quotaReason || "توقفت الطلبات مؤقتًا بسبب استنفاد الحصة.";
+    } else if (!stats.lastError) {
+      state.apiNote = "";
+    }
+    renderBatchMetrics();
+  });
+}
+
+function formatNumber(value: number): string {
+  return Math.max(0, Math.round(value)).toLocaleString("ar-EG");
+}
+
+function renderBatchMetrics(): void {
+  const element = document.getElementById("batch-metrics");
+  if (!element) return;
+  const stats = state.batchStats;
+  const visible =
+    state.busy ||
+    stats.pagesTotal > 0 ||
+    stats.requests > 0 ||
+    stats.errors > 0 ||
+    stats.cacheHits > 0;
+  element.hidden = !visible;
+  if (!visible) {
+    element.innerHTML = "";
+    return;
+  }
+  const cells = [
+    ["الصفحات المحللة", `${formatNumber(stats.pagesAnalyzed)} / ${formatNumber(stats.pagesTotal)}`],
+    ["فقرات OCR", formatNumber(stats.extractedBubbles)],
+    ["الترجمات", `${formatNumber(stats.translatedBubbles)} / ${formatNumber(stats.totalBubbles)}`],
+    ["طلبات Gemini", formatNumber(stats.requests)],
+    ["توكنات فعلية", formatNumber(stats.totalTokens)],
+    ["إصابات الذاكرة", formatNumber(stats.cacheHits)],
+    ["دفعات متبقية", formatNumber(stats.remainingBatches)],
+    ["أخطاء", formatNumber(stats.errors)],
+  ];
+  if (stats.ocrFailures > 0) cells.push(["فشل OCR", formatNumber(stats.ocrFailures)]);
+  if (stats.visionFallbacks > 0) {
+    cells.push(["Vision بديل", formatNumber(stats.visionFallbacks)]);
+  }
+  if (stats.missingBubbles > 0) {
+    cells.push(["فقرات ناقصة", formatNumber(stats.missingBubbles)]);
+  }
+  element.innerHTML = `
+    <div class="batch-metrics-grid">
+      ${cells
+        .map(
+          ([label, value]) =>
+            `<div class="batch-metric"><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`,
+        )
+        .join("")}
+    </div>
+    ${
+      state.apiNote
+        ? `<div class="notice err batch-metric-note">${escapeHtml(state.apiNote)}</div>`
+        : ""
+    }
+  `;
+}
+
 async function doAnalyze(job: PageJob): Promise<void> {
   const settingsError = validateSettings(state.settings);
   if (settingsError) throw new Error(settingsError);
 
   state.batchPhase = "analyze";
+  if (state.batchTotal <= 1) {
+    state.batchStats = emptyBatchStats(1);
+    state.batchTotal = 1;
+    state.batchIndex = 0;
+  }
   job.status = "analyzing";
   job.error = "";
   job.stage = "تهيئة الكشف…";
@@ -1078,16 +1428,40 @@ async function doAnalyze(job: PageJob): Promise<void> {
     });
     job.analysis = analysis;
     job.status = "ready";
+    const ocrTextCount = analysis.sourceTexts.filter((text) => text.trim()).length;
+    const failed = analysis.ocrFailedBoxes?.length ?? 0;
     job.stage =
       analysis.boxes.length > 0
-        ? `${analysis.boxes.length} منطقة نص`
+        ? `${analysis.boxes.length} منطقة · ${ocrTextCount} نص · ${failed} فشل OCR`
         : "لم يتم العثور على نص";
     setProgressPercent(100);
     state.status =
       analysis.boxes.length > 0
-        ? `تم تحليل ${job.name}: ${analysis.boxes.length} منطقة.`
+        ? `تم تحليل ${job.name}: ${analysis.boxes.length} منطقة، و${ocrTextCount} فقرة مقروءة محليًا.`
         : `لم يتم العثور على نص في ${job.name}.`;
-    if (analysis.boxes.length === 0) {
+    if (state.batchTotal <= 1) {
+      state.batchStats.pagesAnalyzed = 1;
+      state.batchStats.extractedBubbles = ocrTextCount;
+      state.batchStats.totalBubbles =
+        state.settings.engine === "gemini" && state.settings.geminiMode === "text"
+        ? ocrTextCount
+        : analysis.boxes.length;
+      state.batchStats.translatedBubbles = analysis.translations.filter((text) =>
+        text.trim(),
+      ).length;
+      state.batchStats.ocrFailures = failed;
+      state.batchStats.batchesTotal = 0;
+      state.batchStats.batchesDone = 0;
+      state.batchStats.remainingBatches = 0;
+      renderBatchMetrics();
+    }
+    if (analysis.ocrError) {
+      toast(
+        `OCR المحلي غير متاح: ${analysis.ocrError}. يمكنك تفعيل Vision كبديل من الإعدادات.`,
+        "err",
+        9000,
+      );
+    } else if (analysis.boxes.length === 0) {
       toast("لم يتم العثور على مناطق نص. جرّب تقليل حد الثقة.", "err", 6000);
     }
   } catch (err) {
@@ -1108,13 +1482,6 @@ async function doRender(job: PageJob): Promise<void> {
     await doAnalyze(job);
   }
   if (!job.analysis) throw new Error("لا توجد نتائج تحليل لهذه الصفحة.");
-
-  if (
-    job.analysis.boxes.length > 0 &&
-    !job.analysis.translations.some((text) => text.trim())
-  ) {
-    throw new Error("لا توجد ترجمات غير فارغة. عدّل الجدول أو أعد التحليل أولًا.");
-  }
 
   state.batchPhase = "render";
   job.status = "rendering";
@@ -1163,6 +1530,7 @@ async function ensureAnalysis(job: PageJob): Promise<void> {
 
 async function ensureRender(job: PageJob): Promise<void> {
   await ensureAnalysis(job);
+  if (state.settings.engine !== "manual") await ensureTranslations(job);
   if (!job.render || job.dirty) await doRender(job);
 }
 
@@ -1170,39 +1538,243 @@ function pageHasTranslations(job: PageJob): boolean {
   return Boolean(job.analysis?.translations.some((text) => text.trim()));
 }
 
-async function translateJob(job: PageJob): Promise<void> {
+interface TranslateJobOptions {
+  manager?: RequestManager;
+  signal?: AbortSignal;
+  force?: boolean;
+}
+
+async function translateVisionFallback(
+  job: PageJob,
+  manager: RequestManager,
+  signal: AbortSignal | undefined,
+  settings: TranslationSettings,
+): Promise<number> {
+  const analysis = job.analysis;
+  if (!analysis || analysis.boxes.length === 0) return 0;
+  const failed = new Set(analysis.ocrFailedBoxes ?? []);
+  const indexes = [...failed].filter(
+    (index) =>
+      index >= 0 &&
+      index < analysis.boxes.length &&
+      !analysis.translations[index]?.trim(),
+  );
+  if (indexes.length === 0) return 0;
+
+  const boxes = indexes.map((index) => analysis.boxes[index]);
+  const visionSettings: TranslationSettings = { ...settings, geminiMode: "vision" };
+  const result = await translatePage(job.url, boxes, visionSettings, {
+    manager,
+    signal,
+  });
+  let translated = 0;
+  indexes.forEach((boxIndex, localIndex) => {
+    const translation = result.translations[localIndex] ?? "";
+    if (translation.trim()) {
+      analysis.translations[boxIndex] = translation;
+      const source = result.sourceTexts?.[localIndex] ?? "";
+      if (source.trim()) analysis.sourceTexts[boxIndex] = source;
+      failed.delete(boxIndex);
+      translated++;
+    }
+  });
+  analysis.ocrFailedBoxes = failed.size > 0 ? [...failed] : undefined;
+  if (translated > 0) {
+    state.batchStats.visionFallbacks += translated;
+    job.dirty = true;
+    if (job.status === "done") job.status = "ready";
+  }
+  return translated;
+}
+
+async function translateJob(job: PageJob, options: TranslateJobOptions = {}): Promise<void> {
   if (!job.analysis) throw new Error("حلل الصفحة أولًا قبل ترجمة المناطق.");
   if (state.settings.engine === "manual") {
     throw new Error("الوضع اليدوي لا يستدعي مزود ترجمة.");
   }
   if (job.analysis.boxes.length === 0) return;
 
-  state.batchPhase = "analyze";
-  setProgressPercent(44);
-  job.stage = "ترجمة المناطق الحالية…";
-  refreshProgress();
+  const standalone = !options.manager;
+  const manager = options.manager ?? createRequestManager();
+  const unsubscribe = standalone ? trackManager(manager) : () => {};
+  const settings = toPipelineSettings(state.settings).translation;
+  const analysis = job.analysis;
+  const force = options.force === true;
+  const translationMode = isTextOnlyTranslation(settings);
+  const targets = analysis.boxes
+    .map((_, index) => index)
+    .filter((index) => {
+      if (!force && analysis.translations[index]?.trim()) return false;
+      if (translationMode && !analysis.sourceTexts[index]?.trim()) return false;
+      return true;
+    });
+
+  if (targets.length === 0 && !(settings.useVisionOnOcrFailure && analysis.ocrFailedBoxes?.length)) {
+    return;
+  }
+
+  if (standalone) {
+    state.batchTotal = Math.max(1, targets.length);
+    state.batchIndex = 0;
+    state.batchPhase = "translate";
+    state.batchStats = emptyBatchStats(1);
+    state.batchStats.pagesAnalyzed = 1;
+  }
+
   try {
-    const result = await translatePage(
-      job.url,
-      job.analysis.boxes,
-      toPipelineSettings(state.settings).translation,
-    );
-    job.analysis.translations = job.analysis.boxes.map(
-      (_, index) => result.translations[index] ?? "",
-    );
-    job.analysis.sourceTexts = job.analysis.boxes.map(
-      (_, index) => result.sourceTexts?.[index] ?? "",
-    );
+    if (translationMode) {
+      const inputs: TranslationBubbleInput[] = targets
+        .filter((index) => analysis.sourceTexts[index]?.trim())
+        .map((index) => ({
+          id: buildBubbleId(state.pages.indexOf(job), index),
+          text: analysis.sourceTexts[index],
+          pageId: job.id,
+          pageIndex: Math.max(0, state.pages.indexOf(job)),
+          boxIndex: index,
+        }));
+      const planned = planTextBatches(inputs, {
+        smartBatch: settings.smartBatch,
+        batchPages: settings.batchPages,
+        tokenBudget: settings.batchTokenBudget,
+        maxSegmentsPerBatch: 120,
+      });
+      state.batchStats.totalBubbles = Math.max(
+        state.batchStats.totalBubbles,
+        analysis.sourceTexts.filter((text) => text.trim()).length,
+      );
+      state.batchStats.extractedBubbles = Math.max(
+        state.batchStats.extractedBubbles,
+        state.batchStats.totalBubbles,
+      );
+      state.batchStats.batchesTotal = planned.length;
+      state.batchStats.remainingBatches = planned.length;
+      if (standalone && planned.length > 0) {
+        state.batchTotal = planned.length;
+        state.batchIndex = 0;
+      }
+      if (inputs.length > 0) {
+        const result = await translateBubbles(inputs, {
+          settings,
+          manager,
+          signal: options.signal,
+          forceRefresh: force,
+          callbacks: {
+            onTranslated: (input, translation) => {
+              const targetJob = state.pages.find((page) => page.id === input.pageId);
+              if (!targetJob?.analysis) return;
+              targetJob.analysis.translations[input.boxIndex] = translation;
+              targetJob.dirty = true;
+              if (targetJob.status === "done") targetJob.status = "ready";
+              state.batchStats.translatedBubbles++;
+              renderBatchMetrics();
+            },
+            onCacheHit: () => {
+              state.batchStats.cacheHits++;
+            },
+            onBatchStart: (batch, index, total) => {
+              state.batchIndex = standalone ? index : state.batchIndex;
+              state.batchStats.remainingBatches = Math.max(0, total - index);
+              state.status = `ترجمة ${batch.segments.length} فقرة (${index + 1}/${total})…`;
+              setProgressPercent(0);
+              refreshProgress();
+            },
+            onBatchComplete: (_batch, _index, total, _translated, error) => {
+              state.batchStats.batchesDone++;
+              state.batchStats.remainingBatches = Math.max(0, total - state.batchStats.batchesDone);
+              if (error) state.batchStats.errors++;
+              if (standalone) {
+                state.batchIndex = state.batchStats.batchesDone;
+                setProgressPercent(100);
+              }
+              renderBatchMetrics();
+              void scheduleProjectSave();
+            },
+            onError: () => {
+              state.batchStats.errors++;
+            },
+          },
+        });
+        state.batchStats.missingBubbles = result.missing.length;
+        state.batchStats.batchesTotal = result.batches;
+        state.batchStats.remainingBatches = Math.max(
+          0,
+          result.batches - state.batchStats.batchesDone,
+        );
+        state.status =
+          result.missing.length > 0
+            ? `ترجمت ${result.translations.size} فقرة، وبقيت ${result.missing.length} فقرة تحتاج إعادة محاولة.`
+            : `تمت ترجمة ${result.translations.size} فقرة.`;
+      }
+    } else {
+      const boxes = targets.map((index) => analysis.boxes[index]);
+      if (boxes.length > 0) {
+        const result = await translatePage(job.url, boxes, settings, {
+          manager,
+          signal: options.signal,
+        });
+        targets.forEach((boxIndex, localIndex) => {
+          analysis.translations[boxIndex] = result.translations[localIndex] ?? "";
+          const source = result.sourceTexts?.[localIndex] ?? "";
+          if (source.trim()) analysis.sourceTexts[boxIndex] = source;
+        });
+        if (standalone) {
+          state.batchStats.translatedBubbles += targets.filter(
+            (index) => analysis.translations[index]?.trim(),
+          ).length;
+        }
+      }
+    }
+
+    if (settings.useVisionOnOcrFailure && analysis.ocrFailedBoxes?.length) {
+      const fallback = await translateVisionFallback(
+        job,
+        manager,
+        options.signal,
+        settings,
+      );
+      if (fallback > 0) {
+        state.status = `تمت ترجمة ${fallback} فقرة عبر Vision بعد فشل OCR.`;
+      }
+    }
+
     job.dirty = true;
     if (job.status === "done") job.status = "ready";
-    job.stage = `${job.analysis.boxes.length} منطقة مترجمة`;
-    setProgressPercent(100);
-    state.status = `تمت ترجمة مناطق ${job.name}.`;
+    job.stage = `${analysis.translations.filter((text) => text.trim()).length} ترجمة`;
+    if (standalone) {
+      state.batchIndex = Math.max(0, state.batchTotal);
+      setProgressPercent(100);
+    }
     scheduleProjectSave();
   } catch (error) {
     job.stage = "فشلت ترجمة المناطق";
     throw error;
+  } finally {
+    unsubscribe();
+    if (standalone) refreshAll();
   }
+}
+
+async function ensureTranslations(job: PageJob): Promise<void> {
+  if (state.settings.engine === "manual") return;
+  if (!job.analysis || job.analysis.boxes.length === 0) return;
+  await translateJob(job);
+}
+
+async function analyzeAndTranslateJob(job: PageJob): Promise<void> {
+  state.batchStats = emptyBatchStats(1);
+  state.batchTotal = 1;
+  state.batchIndex = 0;
+  state.batchPhase = "analyze";
+  await doAnalyze(job);
+  if (state.settings.engine === "manual") {
+    state.batchStats.pagesAnalyzed = 1;
+    state.batchStats.extractedBubbles = job.analysis?.sourceTexts.filter((text) => text.trim()).length ?? 0;
+    renderBatchMetrics();
+    return;
+  }
+  await translateJob(job, { force: true });
+  state.batchStats.pagesAnalyzed = 1;
+  renderBatchMetrics();
 }
 
 async function retranslateSelected(): Promise<void> {
@@ -1230,7 +1802,7 @@ async function retranslateSelected(): Promise<void> {
 
   await runTask(`ترجمة مناطق ${job.name}…`, async () => {
     try {
-      await translateJob(job);
+      await translateJob(job, { force: true });
       state.progress = 100;
     } finally {
       refreshAll();
@@ -2125,6 +2697,13 @@ function selectJob(id: string): void {
   scheduleProjectSave();
 }
 
+function navigatePreviewPage(direction: -1 | 1): void {
+  const index = state.pages.findIndex((page) => page.id === state.selectedId);
+  const nextIndex = index + direction;
+  if (nextIndex < 0 || nextIndex >= state.pages.length) return;
+  selectJob(state.pages[nextIndex].id);
+}
+
 function removeJob(id: string): void {
   if (state.busy) {
     toast("انتظر انتهاء العملية الحالية.", "err");
@@ -2192,55 +2771,199 @@ async function downloadPng(): Promise<void> {
 }
 
 async function analyzeAll(): Promise<void> {
-  if (state.pages.length === 0) {
-    toast("أضف صفحات أولًا.", "err");
-    return;
-  }
-  const settingsError = validateSettings(state.settings);
-  if (settingsError) {
-    toast(settingsError, "err", 7000);
-    return;
-  }
-
-  await runTask("تحليل كل الصفحات…", async () => {
-    const total = state.pages.length;
-    const failures: Array<{ name: string; message: string }> = [];
-    let completed = 0;
-
-    for (let index = 0; index < total; index++) {
-      const job = state.pages[index];
-      state.status = `تحليل الصفحة ${index + 1} من ${total}: ${job.name}`;
-      refreshProgress();
-      try {
-        await doAnalyze(job);
-        completed++;
-      } catch (err) {
-        failures.push({ name: job.name, message: errorMessage(err) });
-      }
-    }
-
-    const analyzedText =
-      completed === total
-        ? `كل الصفحات (${total})`
-        : `${completed} من ${pageCountText(total, true)}`;
-    state.status =
-      failures.length === 0
-        ? `تم تحليل ${analyzedText}.`
-        : `تم تحليل ${analyzedText} · تعذّر تحليل ${pageCountText(failures.length, true)}.`;
-
-    if (failures.length > 0) {
-      const detail =
-        failures.length === 1
-          ? `${failures[0].name}: ${failures[0].message}`
-          : `تعذّر تحليل ${pageCountText(failures.length, true)}. راجع حالة الصفحات للتفاصيل.`;
-      toast(detail, "err", 9000);
-    }
-  });
+  await runBatchPipeline(false);
 }
 
 async function processAll(): Promise<void> {
+  await runBatchPipeline(true);
+}
+
+async function runTextBatchPhase(
+  manager: RequestManager,
+  signal: AbortSignal,
+  failures: Array<{ name: string; message: string }>,
+): Promise<void> {
+  const settings = toPipelineSettings(state.settings).translation;
+  const inputs: TranslationBubbleInput[] = [];
+  let sourceBubbleCount = 0;
+  let existingTranslations = 0;
+
+  for (let pageIndex = 0; pageIndex < state.pages.length; pageIndex++) {
+    const job = state.pages[pageIndex];
+    if (!job.analysis) continue;
+    job.analysis.sourceTexts.forEach((text, boxIndex) => {
+      if (!text.trim()) return;
+      sourceBubbleCount++;
+      if (job.analysis?.translations[boxIndex]?.trim()) {
+        existingTranslations++;
+        return;
+      }
+      inputs.push({
+        id: buildBubbleId(pageIndex, boxIndex),
+        text,
+        pageId: job.id,
+        pageIndex,
+        boxIndex,
+      });
+    });
+  }
+
+  state.batchStats.totalBubbles = sourceBubbleCount;
+  state.batchStats.translatedBubbles = existingTranslations;
+  state.batchStats.extractedBubbles = sourceBubbleCount;
+  if (inputs.length === 0) {
+    state.batchStats.remainingBatches = 0;
+    state.status = sourceBubbleCount > 0
+      ? "كل الفقرات المقروءة مترجمة بالفعل."
+      : "لم يتم استخراج نص محليًا. راجع OCR أو فعّل Vision كبديل.";
+    return;
+  }
+
+  const planned = planTextBatches(inputs, {
+    smartBatch: settings.smartBatch,
+    batchPages: settings.batchPages,
+    tokenBudget: settings.batchTokenBudget,
+    maxSegmentsPerBatch: 120,
+  });
+  state.batchStats.batchesTotal = planned.length;
+  state.batchStats.remainingBatches = planned.length;
+  state.batchTotal = Math.max(1, planned.length);
+  state.batchIndex = 0;
+  state.batchPhase = "translate";
+  state.status = `ترجمة ${inputs.length} فقرة في ${planned.length} دفعة…`;
+  refreshProgress();
+
+  const result = await translateBubbles(inputs, {
+    settings,
+    manager,
+    signal,
+    callbacks: {
+      onTranslated: (input, translation) => {
+        const targetJob = state.pages.find((page) => page.id === input.pageId);
+        if (!targetJob?.analysis) return;
+        targetJob.analysis.translations[input.boxIndex] = translation;
+        targetJob.dirty = true;
+        if (targetJob.status === "done") targetJob.status = "ready";
+        state.batchStats.translatedBubbles++;
+        renderBatchMetrics();
+      },
+      onCacheHit: () => {
+        state.batchStats.cacheHits++;
+      },
+      onBatchStart: (batch, index, total) => {
+        state.batchIndex = index;
+        state.batchStats.remainingBatches = Math.max(0, total - index);
+        state.status = `ترجمة دفعة ${index + 1} من ${total} (${batch.segments.length} فقرة)…`;
+        setProgressPercent(0);
+        refreshProgress();
+      },
+      onBatchComplete: (_batch, index, total, _translated, error) => {
+        state.batchStats.batchesDone++;
+        state.batchStats.remainingBatches = Math.max(0, total - index - 1);
+        if (error) state.batchStats.errors++;
+        state.batchIndex = index + 1;
+        setProgressPercent(0);
+        renderBatchMetrics();
+        void scheduleProjectSave();
+      },
+      onError: () => {
+        state.batchStats.errors++;
+      },
+    },
+  });
+
+  state.batchStats.missingBubbles = result.missing.length;
+  state.batchStats.batchesTotal = result.batches;
+  state.batchStats.remainingBatches = Math.max(
+    0,
+    result.batches - state.batchStats.batchesDone,
+  );
+  if (result.missing.length > 0) {
+    state.status = `ترجمت ${result.translations.size} فقرة، وبقيت ${result.missing.length} فقرة.`;
+  } else {
+    state.status = `تمت ترجمة ${result.translations.size} فقرة من ${inputs.length}.`;
+  }
+
+  if (settings.useVisionOnOcrFailure) {
+    for (const job of state.pages) {
+      if (!job.analysis?.ocrFailedBoxes?.length) continue;
+      try {
+        const translated = await translateVisionFallback(job, manager, signal, settings);
+        if (translated > 0) {
+          state.batchStats.translatedBubbles += translated;
+          state.batchStats.totalBubbles += translated;
+        }
+      } catch (error) {
+        failures.push({ name: job.name, message: errorMessage(error) });
+        state.batchStats.errors++;
+      }
+    }
+  }
+
+  for (const job of state.pages) {
+    if (job.analysis?.translations.some((text) => text.trim())) {
+      job.dirty = true;
+      if (job.status === "done") job.status = "ready";
+    }
+  }
+}
+
+async function runVisionBatchPhase(
+  manager: RequestManager,
+  signal: AbortSignal,
+  failures: Array<{ name: string; message: string }>,
+): Promise<void> {
+  state.batchPhase = "translate";
+  state.batchTotal = Math.max(1, state.pages.length);
+  state.batchIndex = 0;
+  const countTranslations = (job: PageJob): number =>
+    job.analysis?.translations.filter((text) => text.trim()).length ?? 0;
+  state.batchStats.translatedBubbles = state.pages.reduce(
+    (total, job) => total + countTranslations(job),
+    0,
+  );
+  state.batchStats.batchesTotal = Math.max(1, state.pages.length);
+  state.batchStats.batchesDone = 0;
+  state.batchStats.remainingBatches = state.pages.length;
+  let translatedPages = 0;
+  for (let index = 0; index < state.pages.length; index++) {
+    if (signal.aborted) throw new RequestAbortedError();
+    const job = state.pages[index];
+    state.batchIndex = index;
+    if (!job.analysis || job.analysis.boxes.length === 0) {
+      state.batchStats.batchesDone++;
+      state.batchStats.remainingBatches = Math.max(0, state.pages.length - index - 1);
+      setProgressPercent(100);
+      continue;
+    }
+    state.status = `ترجمة الصفحة ${index + 1} من ${state.pages.length}: ${job.name}`;
+    refreshProgress();
+    const before = countTranslations(job);
+    try {
+      await translateJob(job, { manager, signal });
+      const after = countTranslations(job);
+      if (after > before) translatedPages++;
+      state.batchStats.translatedBubbles += Math.max(0, after - before);
+      state.batchStats.batchesDone++;
+      state.batchStats.remainingBatches = Math.max(0, state.pages.length - index - 1);
+    } catch (error) {
+      failures.push({ name: job.name, message: errorMessage(error) });
+      state.batchStats.errors++;
+      if (isAbortError(error) || error instanceof QuotaExhaustedError) throw error;
+    }
+    setProgressPercent(100);
+    refreshProgress();
+  }
+  state.status = `تمت ترجمة ${translatedPages} صفحة عبر Vision.`;
+}
+
+async function runBatchPipeline(render: boolean): Promise<void> {
   if (state.pages.length === 0) {
     toast("أضف صفحات أولًا.", "err");
+    return;
+  }
+  if (state.busy) {
+    toast("انتظر انتهاء العملية الحالية.", "err");
     return;
   }
 
@@ -2253,86 +2976,175 @@ async function processAll(): Promise<void> {
     }
   }
 
-  await runTask(manual ? "تركيب كل الصفحات…" : "ترجمة كل الصفحات…", async () => {
-    const total = state.pages.length;
-    const failures: Array<{ name: string; message: string }> = [];
-    let completed = 0;
-    let skipped = 0;
-    state.batchTotal = total;
+  const total = state.pages.length;
+  const failures: Array<{ name: string; message: string }> = [];
+  const controller = new AbortController();
+  state.batchAbort = controller;
+  state.busy = true;
+  state.batchStats = emptyBatchStats(total);
+  state.batchTotal = total;
+  state.batchIndex = 0;
+  state.batchPhase = "analyze";
+  state.progress = 0;
+  state.apiNote = "";
+  state.status = render
+    ? manual
+      ? "تركيب كل الصفحات…"
+      : "تحليل وترجمة وتركيب كل الصفحات…"
+    : "تحليل كل الصفحات…";
+  const manager = manual ? null : createRequestManager();
+  const unsubscribe = manager ? trackManager(manager) : () => {};
+  let analyzed = 0;
+  let rendered = 0;
+  let skipped = 0;
+  let stopped = false;
 
-    try {
+  refreshAll();
+
+  try {
+    for (let index = 0; index < total; index++) {
+      if (controller.signal.aborted) throw new RequestAbortedError();
+      const job = state.pages[index];
+      state.batchIndex = index;
+      state.batchPhase = "analyze";
+      state.status = `تحليل الصفحة ${index + 1} من ${total}: ${job.name}`;
+      refreshProgress();
+      try {
+        const textOnly = isTextOnlyTranslation(
+          toPipelineSettings(state.settings).translation,
+        );
+        const hasSourceText = job.analysis?.sourceTexts.some((text) => text.trim()) ?? false;
+        const hasTranslations =
+          job.analysis?.translations.some((text) => text.trim()) ?? false;
+        const needsOcrUpgrade =
+          textOnly &&
+          Boolean(job.analysis) &&
+          job.analysis!.boxes.length > 0 &&
+          !job.analysis!.ocrEngine &&
+          !hasSourceText &&
+          !hasTranslations;
+        if (!job.analysis || needsOcrUpgrade) {
+          await doAnalyze(job);
+        }
+        analyzed++;
+      } catch (error) {
+        failures.push({ name: job.name, message: errorMessage(error) });
+        state.batchStats.errors++;
+      }
+      state.batchStats.pagesAnalyzed = analyzed;
+      const sourceCount =
+        job.analysis?.sourceTexts.filter((text) => text.trim()).length ?? 0;
+      state.batchStats.extractedBubbles += sourceCount;
+      state.batchStats.ocrFailures += job.analysis?.ocrFailedBoxes?.length ?? 0;
+      state.batchStats.totalBubbles += isTextOnlyTranslation(
+        toPipelineSettings(state.settings).translation,
+      )
+        ? sourceCount
+        : job.analysis?.boxes.length ?? 0;
+      state.batchStats.translatedBubbles +=
+        job.analysis?.translations.filter((text) => text.trim()).length ?? 0;
+      setProgressPercent(100);
+      refreshProgress();
+    }
+
+    if (!manual && manager) {
+      if (isTextOnlyTranslation(toPipelineSettings(state.settings).translation)) {
+        await runTextBatchPhase(manager, controller.signal, failures);
+      } else {
+        await runVisionBatchPhase(manager, controller.signal, failures);
+      }
+    }
+
+    if (render) {
+      state.batchPhase = "render";
+      state.batchTotal = total;
+      state.batchIndex = 0;
       for (let index = 0; index < total; index++) {
+        if (controller.signal.aborted) throw new RequestAbortedError();
         const job = state.pages[index];
         state.batchIndex = index;
-        state.batchPhase = "analyze";
-        state.status = `${manual ? "تركيب" : "ترجمة"} الصفحة ${index + 1} من ${total}: ${job.name}`;
+        state.status = `تركيب الصفحة ${index + 1} من ${total}: ${job.name}`;
         refreshProgress();
-
-        try {
-          await ensureAnalysis(job);
-          if (
-            !manual &&
-            job.analysis &&
-            job.analysis.boxes.length > 0 &&
-            !pageHasTranslations(job)
-          ) {
-            await translateJob(job);
-          }
-          if (
-            manual &&
-            job.analysis &&
-            job.analysis.boxes.length > 0 &&
-            !pageHasTranslations(job)
-          ) {
-            skipped++;
-            state.batchPhase = "render";
-            setProgressPercent(100);
-            continue;
-          }
-
-          await ensureRender(job);
-          state.batchPhase = "render";
-          completed++;
+        if (!job.analysis) {
           setProgressPercent(100);
-        } catch (err) {
-          failures.push({ name: job.name, message: errorMessage(err) });
-          state.batchPhase = "render";
-          setProgressPercent(100);
+          continue;
         }
+        if (job.render && !job.dirty) {
+          skipped++;
+          setProgressPercent(100);
+          refreshProgress();
+          continue;
+        }
+        try {
+          await doRender(job);
+          rendered++;
+        } catch (error) {
+          failures.push({ name: job.name, message: errorMessage(error) });
+          state.batchStats.errors++;
+        }
+        setProgressPercent(100);
+        refreshProgress();
       }
-    } finally {
-      state.batchTotal = 0;
-      state.batchIndex = 0;
-      state.batchPhase = "analyze";
     }
+  } catch (error) {
+    if (isAbortError(error)) {
+      stopped = true;
+      state.status = "تم إيقاف العملية. الصفحات والترجمات المكتملة محفوظة.";
+      toast("تم الإيقاف. يمكنك المتابعة لاحقًا؛ لن تُعاد الصفحات المكتملة.", "info", 9000);
+    } else if (error instanceof QuotaExhaustedError) {
+      stopped = true;
+      state.status =
+        "توقفت الترجمة مؤقتًا بسبب حد الحصة. أكمل لاحقًا؛ الترجمات المكتملة محفوظة.";
+      toast(error.message, "err", 12000);
+    } else {
+      stopped = true;
+      state.status = `توقف التنفيذ: ${errorMessage(error)}`;
+      toast(errorMessage(error), "err", 10000);
+    }
+  } finally {
+    state.batchAbort = null;
+    state.busy = false;
+    state.batchTotal = 0;
+    state.batchIndex = 0;
+    state.batchPhase = "analyze";
+    unsubscribe();
+    refreshAll();
+    void refreshCacheStatus();
+    scheduleProjectSave(0);
+  }
 
-    const action = manual ? "معالجة" : "ترجمة";
-    const completedText =
-      completed === total
-        ? `كل الصفحات (${total})`
-        : `${completed} من ${pageCountText(total, true)}`;
-    const parts = [`تمت ${action} ${completedText}`];
-    if (skipped > 0) parts.push(`تخطي ${pageCountText(skipped, true)} بلا ترجمة`);
-    if (failures.length > 0) {
-      parts.push(`تعذّرت معالجة ${pageCountText(failures.length, true)}`);
-    }
-    state.status = `${parts.join(" · ")}.`;
+  if (stopped) return;
 
-    if (failures.length > 0) {
-      const detail =
-        failures.length === 1
-          ? `${failures[0].name}: ${failures[0].message}`
-          : `تعذّرت معالجة ${pageCountText(failures.length, true)}: ${failures
-              .slice(0, 3)
-              .map((failure) => failure.name)
-              .join("، ")}${failures.length > 3 ? "…" : ""}. راجع حالة الصفحات للتفاصيل.`;
-      toast(detail, "err", 10000);
-    } else if (completed > 0) {
-      toast(`تمت ${action} ${pageCountText(completed, true)}.`, "ok", 6000);
-    } else if (skipped > 0) {
-      toast("لم يتم تركيب أي صفحة. أضف ترجمات للصفحات أولًا.", "err", 8000);
-    }
-  });
+  const parts = [`تم تحليل ${analyzed} من ${pageCountText(total, true)}`];
+  if (!manual) {
+    parts.push(
+      `ترجمة ${state.batchStats.translatedBubbles} من ${state.batchStats.totalBubbles} فقرة`,
+    );
+  }
+  if (render) {
+    parts.push(`تركيب ${rendered} صفحة`);
+    if (skipped > 0) parts.push(`تخطي ${skipped} جاهزة`);
+  }
+  if (failures.length > 0) parts.push(`تعذّر ${failures.length}`);
+  if (state.batchStats.cacheHits > 0) parts.push(`ذاكرة ${state.batchStats.cacheHits}`);
+  state.status = `${parts.join(" · ")}.`;
+  renderStatus();
+
+  if (failures.length > 0) {
+    const detail =
+      failures.length === 1
+        ? `${failures[0].name}: ${failures[0].message}`
+        : `تعذّرت ${failures.length} صفحة. راجع حالة الصفحات للتفاصيل.`;
+    toast(detail, "err", 10000);
+  } else if (rendered > 0 || analyzed > 0) {
+    toast(
+      render
+        ? `تمت معالجة ${pageCountText(rendered || analyzed, true)}.`
+        : `تم تحليل ${pageCountText(analyzed, true)} وترجمتها.`,
+      "ok",
+      6000,
+    );
+  }
 }
 
 async function downloadAll(): Promise<void> {
@@ -2340,49 +3152,75 @@ async function downloadAll(): Promise<void> {
     toast("أضف صفحات أولًا.", "err");
     return;
   }
-  await runTask("تجهيز ملف ZIP…", async () => {
+  const formatElement = document.getElementById("download-format") as HTMLSelectElement | null;
+  const format = (["psd", "png", "both"].includes(formatElement?.value ?? "")
+    ? formatElement?.value
+    : "psd") as ArchiveFormat;
+  const formatLabel = format === "both" ? "PSD وPNG" : format.toUpperCase();
+
+  await runTask(`تجهيز حزمة ${formatLabel}…`, async () => {
     const zip = new JSZip();
     const used = new Set<string>();
     const failures: Array<{ name: string; message: string }> = [];
-    let added = 0;
+    let addedPages = 0;
+    let addedFiles = 0;
 
     for (let index = 0; index < state.pages.length; index++) {
       const job = state.pages[index];
-      state.status = `تجهيز PSD ${index + 1} من ${state.pages.length}: ${job.name}`;
+      state.status = `تجهيز ${formatLabel} ${index + 1} من ${state.pages.length}: ${job.name}`;
       refreshProgress();
       try {
         await ensureRender(job);
         if (!job.render) {
-          failures.push({ name: job.name, message: "لم يتم إنشاء PSD." });
+          failures.push({ name: job.name, message: "لم يتم إنشاء ملفات الإخراج." });
           continue;
         }
-        let name = `${baseName(job.name)}.psd`;
-        let suffix = 2;
-        while (used.has(name)) name = `${baseName(job.name)}-${suffix++}.psd`;
-        used.add(name);
-        zip.file(name, job.render.psd);
-        added++;
+        const uniqueName = (suffix: string): string => {
+          let name = `${baseName(job.name)}${suffix}`;
+          let number = 2;
+          while (used.has(name)) name = `${baseName(job.name)}-${number++}${suffix}`;
+          used.add(name);
+          return name;
+        };
+
+        if (format === "psd" || format === "both") {
+          zip.file(uniqueName(".psd"), job.render.psd);
+          addedFiles++;
+        }
+        if (format === "png" || format === "both") {
+          const png = await fetch(job.render.finalUrl);
+          if (!png.ok) throw new Error("تعذّر تحضير صورة PNG النهائية.");
+          zip.file(uniqueName("-ar.png"), await png.arrayBuffer());
+          addedFiles++;
+        }
+        addedPages++;
       } catch (err) {
         failures.push({ name: job.name, message: errorMessage(err) });
       }
     }
 
-    if (added === 0) {
+    if (addedFiles === 0) {
       throw new Error(
         failures.length > 0
-          ? `لم يتم إنشاء أي PSD. تعذّر تجهيز ${failures.length} صفحة.`
-          : "لم يتم إنشاء أي PSD.",
+          ? `لم يتم إنشاء أي ملف. تعذّر تجهيز ${failures.length} صفحة.`
+          : "لم يتم إنشاء أي ملف للتصدير.",
       );
     }
 
     state.status = "ضغط الملفات…";
     refreshProgress();
     const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
-    downloadBlob(blob, "manga-psd-pages.zip");
-    state.status = `تم تنزيل ${added} ملف PSD داخل ZIP${
+    const archiveName =
+      format === "psd"
+        ? "manga-psd-pages.zip"
+        : format === "png"
+          ? "manga-png-pages.zip"
+          : "manga-pages.zip";
+    downloadBlob(blob, archiveName);
+    state.status = `تم تنزيل ${addedFiles} ملف (${formatLabel}) لـ ${addedPages} صفحة داخل ZIP${
       failures.length > 0 ? ` · تعذّر ${failures.length}` : ""
     }.`;
-    toast(`تم تنزيل ${added} ملف PSD.`, "ok");
+    toast(`تم تنزيل ${addedFiles} ملف داخل ZIP.`, "ok");
 
     if (failures.length > 0) {
       const detail =
@@ -2554,6 +3392,12 @@ function bindEvents(): void {
 
   document.getElementById("analyze-all")?.addEventListener("click", () => void analyzeAll());
   document.getElementById("process-all")?.addEventListener("click", () => void processAll());
+  document.getElementById("stop-batch")?.addEventListener("click", () => {
+    if (!state.batchAbort) return;
+    state.status = "جارٍ إيقاف العملية بعد الطلب الحالي…";
+    state.batchAbort.abort();
+    renderStatus();
+  });
   document.getElementById("download-all")?.addEventListener("click", () => void downloadAll());
   document.getElementById("clear-all")?.addEventListener("click", clearAll);
 
@@ -2599,6 +3443,14 @@ function bindEvents(): void {
     selectJob(id);
   });
 
+  document.getElementById("pages-previous-page")?.addEventListener("click", () => {
+    navigatePreviewPage(-1);
+  });
+
+  document.getElementById("pages-next-page")?.addEventListener("click", () => {
+    navigatePreviewPage(1);
+  });
+
   document.getElementById("preview-tabs")?.addEventListener("click", (event) => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>("[data-tab]");
     if (!button || button.disabled) return;
@@ -2606,6 +3458,14 @@ function bindEvents(): void {
     if (state.previewTab !== "original") state.boxEditMode = false;
     renderPreview();
     renderTranslations();
+  });
+
+  document.getElementById("preview-previous-page")?.addEventListener("click", () => {
+    navigatePreviewPage(-1);
+  });
+
+  document.getElementById("preview-next-page")?.addEventListener("click", () => {
+    navigatePreviewPage(1);
   });
 
   document.getElementById("preview-side")?.addEventListener("click", (event) => {
@@ -2696,6 +3556,20 @@ function bindEvents(): void {
       (document.getElementById("custom-font-input") as HTMLInputElement | null)?.click();
       return;
     }
+    if (target.closest("#clear-translation-cache")) {
+      event.preventDefault();
+      void (async () => {
+        if (!window.confirm("مسح كل الترجمات المحفوظة في ذاكرة هذا المتصفح؟")) return;
+        try {
+          await clearTranslationCache();
+          await refreshCacheStatus();
+          toast("تم مسح ذاكرة الترجمة. لن تتأثر الترجمات الظاهرة في المشروع.", "ok", 6000);
+        } catch (error) {
+          toast(errorMessage(error), "err", 7000);
+        }
+      })();
+      return;
+    }
 
     const actionButton = target.closest<HTMLElement>("[data-font-action]");
     if (!actionButton) return;
@@ -2709,13 +3583,13 @@ function bindEvents(): void {
   });
 
   document.getElementById("settings-body")?.addEventListener("input", (event) => {
-    const target = event.target as HTMLInputElement | HTMLSelectElement;
+    const target = event.target as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
     const key = target.dataset.setting as keyof AppSettings | undefined;
     if (!key) return;
     updateSetting(key, target);
   });
   document.getElementById("settings-body")?.addEventListener("change", (event) => {
-    const target = event.target as HTMLInputElement | HTMLSelectElement;
+    const target = event.target as HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement;
     if (target instanceof HTMLInputElement && target.id === "custom-font-input") {
       const file = target.files?.[0];
       target.value = "";
@@ -2740,7 +3614,10 @@ const RENDER_SETTING_KEYS = new Set<keyof AppSettings>([
   "inpaintMethod",
 ]);
 
-function updateSetting(key: keyof AppSettings, target: HTMLInputElement | HTMLSelectElement): void {
+function updateSetting(
+  key: keyof AppSettings,
+  target: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement,
+): void {
   const value =
     target instanceof HTMLInputElement && target.type === "checkbox"
       ? target.checked
@@ -2750,7 +3627,10 @@ function updateSetting(key: keyof AppSettings, target: HTMLInputElement | HTMLSe
 
   const previous = state.settings[key];
   (state.settings as unknown as Record<string, unknown>)[key] = value;
-  saveSettings(state.settings);
+  const saved = saveSettings(state.settings);
+  if (!saved && (key === "geminiApiKey" || key === "openaiApiKey")) {
+    toast("تعذّر حفظ المفتاح في تخزين المتصفح. لن يبقى بعد إعادة تحميل الصفحة.", "err", 8000);
+  }
   if (previous !== value && RENDER_SETTING_KEYS.has(key)) markRendersDirty();
   scheduleProjectSave();
 }

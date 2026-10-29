@@ -85,10 +85,24 @@ const PROJECT_SETTING_KEYS = [
   "sourceLang",
   "engine",
   "geminiModel",
+  "geminiBaseUrl",
+  "geminiMode",
   "openaiBaseUrl",
   "openaiModel",
   "openaiJsonMode",
   "temperature",
+  "smartBatch",
+  "batchPages",
+  "batchTokenBudget",
+  "maxConcurrentRequests",
+  "rpmLimit",
+  "tpmLimit",
+  "maxRetries",
+  "useCountTokens",
+  "cacheEnabled",
+  "useVisionOnOcrFailure",
+  "seriesSummary",
+  "glossary",
   "detectionModel",
   "detectionMinConfidence",
   "inpaintMethod",
@@ -244,7 +258,7 @@ function normalizeAnalysis(value: unknown, width: number, height: number): PageA
   }
   const rawTranslations = Array.isArray(record.translations) ? record.translations : [];
   const rawSourceTexts = Array.isArray(record.sourceTexts) ? record.sourceTexts : [];
-  return {
+  const analysis: PageAnalysis = {
     boxes,
     translations: boxes.map((_, index) =>
       typeof rawTranslations[index] === "string" ? (rawTranslations[index] as string) : "",
@@ -253,6 +267,27 @@ function normalizeAnalysis(value: unknown, width: number, height: number): PageA
       typeof rawSourceTexts[index] === "string" ? (rawSourceTexts[index] as string) : "",
     ),
   };
+  if (Array.isArray(record.ocrFailedBoxes)) {
+    const failed = record.ocrFailedBoxes
+      .map((value) => finiteNumber(value))
+      .filter((value): value is number => value !== null && value >= 0 && value < boxes.length)
+      .map((value) => Math.floor(value));
+    analysis.ocrFailedBoxes = [...new Set(failed)];
+  }
+  if (Array.isArray(record.ocrConfidences)) {
+    const rawConfidences = record.ocrConfidences;
+    analysis.ocrConfidences = boxes.map((_, index) => {
+      const value = finiteNumber(rawConfidences[index]);
+      return value === null ? 0 : clamp(value, 0, 1);
+    });
+  }
+  if (typeof record.ocrEngine === "string") {
+    analysis.ocrEngine = cleanString(record.ocrEngine, 160);
+  }
+  if (typeof record.ocrError === "string") {
+    analysis.ocrError = cleanString(record.ocrError, 1000);
+  }
+  return analysis;
 }
 
 function normalizeSettings(value: unknown): Partial<ProjectSettings> {
@@ -268,6 +303,12 @@ function normalizeSettings(value: unknown): Partial<ProjectSettings> {
   if (typeof record.geminiModel === "string") {
     settings.geminiModel = cleanString(record.geminiModel, 160);
   }
+  if (typeof record.geminiBaseUrl === "string") {
+    settings.geminiBaseUrl = cleanString(record.geminiBaseUrl, 500);
+  }
+  if (record.geminiMode === "text" || record.geminiMode === "vision") {
+    settings.geminiMode = record.geminiMode;
+  }
   if (typeof record.openaiBaseUrl === "string") {
     settings.openaiBaseUrl = cleanString(record.openaiBaseUrl, 500);
   }
@@ -277,6 +318,32 @@ function normalizeSettings(value: unknown): Partial<ProjectSettings> {
   if (typeof record.openaiJsonMode === "boolean") settings.openaiJsonMode = record.openaiJsonMode;
   const temperature = finiteNumber(record.temperature);
   if (temperature !== null && temperature >= 0 && temperature <= 2) settings.temperature = temperature;
+
+  for (const key of ["smartBatch", "useCountTokens", "cacheEnabled", "useVisionOnOcrFailure"] as const) {
+    if (typeof record[key] === "boolean") settings[key] = record[key] as boolean;
+  }
+  const batchPages = finiteNumber(record.batchPages);
+  if (batchPages !== null) settings.batchPages = Math.round(clamp(batchPages, 1, 8));
+  const batchTokenBudget = finiteNumber(record.batchTokenBudget);
+  if (batchTokenBudget !== null) {
+    settings.batchTokenBudget = Math.round(clamp(batchTokenBudget, 1000, 1_000_000));
+  }
+  const maxConcurrentRequests = finiteNumber(record.maxConcurrentRequests);
+  if (maxConcurrentRequests !== null) {
+    settings.maxConcurrentRequests = Math.round(clamp(maxConcurrentRequests, 1, 4));
+  }
+  for (const key of ["rpmLimit", "tpmLimit"] as const) {
+    const value = finiteNumber(record[key]);
+    if (value !== null && value >= 0) settings[key] = Math.round(value);
+  }
+  const maxRetries = finiteNumber(record.maxRetries);
+  if (maxRetries !== null) settings.maxRetries = Math.round(clamp(maxRetries, 0, 10));
+  if (typeof record.seriesSummary === "string") {
+    settings.seriesSummary = cleanString(record.seriesSummary, 4000);
+  }
+  if (typeof record.glossary === "string") {
+    settings.glossary = cleanString(record.glossary, 8000);
+  }
   if (typeof record.detectionModel === "string") {
     settings.detectionModel = cleanString(record.detectionModel, 100);
   }

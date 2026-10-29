@@ -40,6 +40,14 @@ function ortLoaderPlugin(): Plugin {
             next();
             return;
           }
+          // This endpoint is also used as an ES-module Web Worker by ORT's
+          // threaded WASM runtime. Because it ends the response before Vite's
+          // normal static middleware, copy the isolation headers explicitly.
+          // Without them Chrome blocks the worker under COEP.
+          for (const [header, value] of Object.entries(isolationHeaders)) {
+            res.setHeader(header, value);
+          }
+          res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
           res.setHeader("Content-Type", "text/javascript; charset=utf-8");
           res.setHeader("Cache-Control", "no-cache");
           res.end(data);
